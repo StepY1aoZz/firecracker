@@ -12,6 +12,7 @@ use zerocopy::{Immutable, IntoBytes};
 use crate::{AcpiError, Result, Sdt, SdtHeader, checksum};
 
 const MADT_CPU_ENABLE_FLAG: u32 = 0;
+const MADT_CPU_ONLINE_CAPABLE_FLAG: u32 = 1;
 
 // clippy doesn't understand that we actually "use" the fields of this struct when we serialize
 // them as bytes in guest memory, so here we just ignore dead code to avoid having to name
@@ -28,13 +29,22 @@ pub struct LocalAPIC {
 }
 
 impl LocalAPIC {
-    pub fn new(cpu_id: u8) -> Self {
+    /// Create a local APIC entry for a CPU that can be hot-added.
+    ///
+    /// Every entry is online-capable. Entries for CPUs present at boot also have
+    /// the enabled bit set, as required by the MADT local APIC flags definition.
+    pub fn new(cpu_id: u8, enabled: bool) -> Self {
+        let mut flags = 1u32 << MADT_CPU_ONLINE_CAPABLE_FLAG;
+        if enabled {
+            flags |= 1u32 << MADT_CPU_ENABLE_FLAG;
+        }
+
         Self {
             r#type: 0,
             length: 8,
             processor_uid: cpu_id,
             apic_id: cpu_id,
-            flags: U32::new(1u32 << MADT_CPU_ENABLE_FLAG),
+            flags: U32::new(flags),
         }
     }
 }
@@ -138,5 +148,24 @@ impl Sdt for Madt {
         mem.write_slice(self.interrupt_controllers.as_bytes(), address)?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use zerocopy::IntoBytes;
+
+    use super::LocalAPIC;
+
+    #[test]
+    fn test_enabled_local_apic_is_online_capable() {
+        let apic = LocalAPIC::new(7, true);
+        assert_eq!(apic.as_bytes(), &[0, 8, 7, 7, 3, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_disabled_local_apic_is_online_capable() {
+        let apic = LocalAPIC::new(8, false);
+        assert_eq!(apic.as_bytes(), &[0, 8, 8, 8, 2, 0, 0, 0]);
     }
 }

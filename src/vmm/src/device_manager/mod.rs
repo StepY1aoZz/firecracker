@@ -332,7 +332,29 @@ impl DeviceManager {
     pub(crate) fn attach_vmclock_device(&mut self, vm: &KvmVm) -> Result<(), AttachDeviceError> {
         self.acpi_devices.attach_vmclock(vm)?;
         self.acpi_devices.activate_vmclock(vm)?;
+        // Allocate the CPU container last so VMGenID and VMClock retain their
+        // existing guest addresses and GSI assignments.
+        #[cfg(target_arch = "x86_64")]
+        self.acpi_devices.attach_cpu_container(vm)?;
         Ok(())
+    }
+
+    /// Mark a contiguous range of newly created vCPUs as inserting and send
+    /// the guest a GED notification. The range is end-exclusive.
+    #[cfg(target_arch = "x86_64")]
+    pub fn hot_add_vcpus(
+        &mut self,
+        new_vcpus: std::ops::Range<u8>,
+    ) -> Result<(), crate::devices::acpi::cpu_container::CpuContainerError> {
+        self.acpi_devices.hot_add_vcpus(new_vcpus)
+    }
+
+    /// Re-notify the guest about CPU insertions restored in a pending state.
+    #[cfg(target_arch = "x86_64")]
+    pub fn notify_pending_vcpus(
+        &mut self,
+    ) -> Result<(), crate::devices::acpi::cpu_container::CpuContainerError> {
+        self.acpi_devices.notify_pending_vcpus()
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -1126,6 +1148,48 @@ pub(crate) mod tests {
             socket: None,
             dmb_size_mib: None,
         }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_cpu_container_is_attached_once_at_boot() {
+        let (vmm, _event_manager) = crate::test_utils::default_vmm_no_boot(None);
+        let mut vmm = vmm.lock().unwrap();
+        let container = vmm
+            .device_manager
+            .acpi_devices
+            .cpu_container()
+            .expect("CPU container missing from boot device set")
+            .clone();
+        let (mmio_address, gsi) = {
+            let container = container.lock().unwrap();
+            (container.mmio_address.0, container.gsi)
+        };
+
+        // Re-attaching VMClock (as some test builders do) must not allocate a
+        // second CPU container or replace its resources.
+        let kvm_vm = vmm.vm.as_kvm().unwrap().clone();
+        vmm.device_manager.attach_vmclock_device(&kvm_vm).unwrap();
+        let container_after = vmm
+            .device_manager
+            .acpi_devices
+            .cpu_container()
+            .unwrap()
+            .lock()
+            .unwrap();
+        assert_eq!(container_after.mmio_address.0, mmio_address);
+        assert_eq!(container_after.gsi, gsi);
+        drop(container_after);
+
+        let mut status = [0];
+        vmm.vm
+            .as_kvm()
+            .unwrap()
+            .common
+            .mmio_bus
+            .read(mmio_address + 4, &mut status)
+            .unwrap();
+        assert_eq!(status[0] & 1, 1, "boot vCPU 0 must be enabled");
     }
 
     #[test]

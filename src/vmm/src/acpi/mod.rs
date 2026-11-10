@@ -39,6 +39,8 @@ pub enum AcpiError {
     AcpiTables(#[from] acpi_tables::AcpiError),
     /// Error creating AML bytecode: {0}
     AmlError(#[from] aml::AmlError),
+    /// Error configuring ACPI devices: {0}
+    AcpiDevice(#[from] crate::device_manager::acpi::ACPIDeviceError),
 }
 
 /// Helper type that holds the guest memory in which we write the tables in and a resource
@@ -200,6 +202,12 @@ pub(crate) fn create_acpi_tables(
     let last_bus = device_manager
         .pci_devices()
         .map_or(0, |pci_devices| pci_devices.pci_segment().last_bus_number());
+
+    // Device attachment happens before the boot vCPU count is passed to ACPI
+    // table generation. Enable those CPUs in the container before emitting AML.
+    device_manager
+        .acpi_devices
+        .enable_boot_vcpus(vcpus.len().try_into().unwrap())?;
 
     let mut writer = AcpiTableWriter { mem };
     let dsdt_addr = writer.build_dsdt(device_manager, resource_allocator)?;

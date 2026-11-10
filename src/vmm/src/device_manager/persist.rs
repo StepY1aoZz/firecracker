@@ -13,6 +13,8 @@ use super::mmio::*;
 use crate::EventManager;
 use crate::device_manager::DevicePersistError;
 use crate::device_manager::acpi::ACPIDeviceError;
+#[cfg(target_arch = "x86_64")]
+use crate::devices::acpi::cpu_container::{CpuContainer, CpuContainerState};
 use crate::devices::acpi::vmclock::{VmClock, VmClockState};
 use crate::devices::acpi::vmgenid::{VMGenIDState, VmGenId};
 #[cfg(target_arch = "aarch64")]
@@ -195,6 +197,9 @@ impl fmt::Debug for MMIODevManagerConstructorArgs<'_> {
 pub struct ACPIDeviceManagerState {
     vmgenid: VMGenIDState,
     vmclock: VmClockState,
+    #[cfg(target_arch = "x86_64")]
+    #[serde(default)]
+    cpu_container: Option<CpuContainerState>,
 }
 
 /// Holds the states of the non-virtio (platform) devices connected over the MMIO transport.
@@ -223,6 +228,10 @@ impl<'a> Persist<'a> for ACPIDeviceManager {
         ACPIDeviceManagerState {
             vmgenid: self.vmgenid().save(),
             vmclock: self.vmclock().save(),
+            #[cfg(target_arch = "x86_64")]
+            cpu_container: self
+                .cpu_container()
+                .map(|container| container.lock().expect("Poisoned lock").save()),
         }
     }
 
@@ -231,6 +240,15 @@ impl<'a> Persist<'a> for ACPIDeviceManager {
             VmGenId::restore((), &state.vmgenid)?,
             VmClock::restore((), &state.vmclock)?,
         );
+
+        #[cfg(target_arch = "x86_64")]
+        if let Some(container_state) = &state.cpu_container {
+            let container = Arc::new(Mutex::new(CpuContainer::restore((), container_state)?));
+            // VM state restoration has already replayed the MMIO allocator,
+            // including this device's saved address. Reuse that exact address
+            // for the bus mapping; only legacy GSIs need explicit replay.
+            acpi_devices.attach_cpu_container_device(vm, container)?;
+        }
 
         acpi_devices.replay_gsi_allocations(vm)?;
 
@@ -854,6 +872,93 @@ mod tests {
             fresh[0],
             restored_gsis
         );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_acpi_cpu_container_persistence() {
+        use vm_allocator::AllocPolicy;
+
+        use crate::utils::mib_to_bytes;
+        use crate::vstate::resources::ResourceAllocator;
+        use crate::vstate::vm::tests::setup_vm_with_memory;
+
+        let source_vm = setup_vm_with_memory(mib_to_bytes(2));
+        source_vm.setup_irqchip().unwrap();
+        let source_vm = Arc::new(source_vm);
+        let (vmgenid, vmclock) = {
+            let mut allocator = source_vm.resource_allocator();
+            (
+                VmGenId::new(&mut allocator).unwrap(),
+                VmClock::new(&mut allocator).unwrap(),
+            )
+        };
+        let mut source_manager = ACPIDeviceManager::new(vmgenid, vmclock);
+        source_manager.attach_cpu_container(&source_vm).unwrap();
+        source_manager.enable_boot_vcpus(2).unwrap();
+        source_manager.hot_add_vcpus(2..4).unwrap();
+
+        let (mmio_address, gsi) = {
+            let container = source_manager.cpu_container().unwrap();
+            let container = container.lock().unwrap();
+            (container.mmio_address.0, container.gsi)
+        };
+        let write_result = source_vm
+            .common
+            .mmio_bus
+            .write(mmio_address, &3u32.to_le_bytes())
+            .unwrap();
+        assert!(write_result.is_none());
+
+        let allocator_state = source_vm.resource_allocator().save();
+        let state = source_manager.save();
+        let serialized = bitcode::serialize(&state).unwrap();
+        let decoded: ACPIDeviceManagerState = bitcode::deserialize(&serialized).unwrap();
+
+        let restored_vm = setup_vm_with_memory(mib_to_bytes(2));
+        restored_vm.setup_irqchip().unwrap();
+        *restored_vm.resource_allocator() =
+            ResourceAllocator::restore((), &allocator_state).unwrap();
+        let restored_manager = ACPIDeviceManager::restore(&restored_vm, &decoded).unwrap();
+
+        let restored_container = restored_manager.cpu_container().unwrap();
+        let restored_container = restored_container.lock().unwrap();
+        assert_eq!(restored_container.mmio_address.0, mmio_address);
+        assert_eq!(restored_container.gsi, gsi);
+        assert_eq!(
+            restored_container.save(),
+            decoded.cpu_container.as_ref().unwrap().clone()
+        );
+        drop(restored_container);
+
+        assert!(
+            restored_vm
+                .resource_allocator()
+                .gsi_legacy_allocator
+                .is_allocated(gsi)
+        );
+        // The MMIO range comes from the restored allocator state and must not
+        // be handed out a second time.
+        restored_vm
+            .resource_allocator()
+            .mmio32_memory
+            .allocate(MMIO_LEN, MMIO_LEN, AllocPolicy::ExactMatch(mmio_address))
+            .unwrap_err();
+
+        let mut selected = [0; 4];
+        restored_vm
+            .common
+            .mmio_bus
+            .read(mmio_address, &mut selected)
+            .unwrap();
+        assert_eq!(u32::from_le_bytes(selected), 3);
+        let mut status = [0];
+        restored_vm
+            .common
+            .mmio_bus
+            .read(mmio_address + 4, &mut status)
+            .unwrap();
+        assert_eq!(status[0], 1 << 1);
     }
 
     #[test]
