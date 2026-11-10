@@ -12,6 +12,8 @@ use std::time::Duration;
 
 use userfaultfd::{Event, FeatureFlags, UffdBuilder};
 use vm_memory::GuestMemoryBackend;
+#[cfg(target_arch = "x86_64")]
+use vmm::VcpuAffinity;
 use vmm::arch::host_page_size;
 use vmm::builder::build_and_boot_microvm;
 use vmm::devices::virtio::block::CacheType;
@@ -37,6 +39,7 @@ use vmm::vmm_config::snapshot::{
     CreateSnapshotParams, LoadSnapshotParams, MemBackendConfig, MemBackendType,
     SnapshotLoadHugePageConfig, SnapshotType,
 };
+use vmm::vmm_config::vcpu_hotplug::HotplugVcpuConfig;
 use vmm::vmm_config::vsock::VsockDeviceConfig;
 use vmm::vstate::memory::test_utils::into_region_ext;
 use vmm::vstate::memory::{
@@ -145,6 +148,49 @@ fn test_pause_resume_microvm() {
             pause_resume_microvm(vmm);
         }
     }
+}
+
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn test_hotplug_vcpu_while_paused() {
+    let (vmm, _) = default_vmm_no_boot(Some(NOISY_KERNEL_IMAGE));
+    let host_cpu = {
+        // SAFETY: The CPU set is zeroed before use and sched_getaffinity receives its valid size.
+        unsafe {
+            let mut cpu_set = std::mem::zeroed::<libc::cpu_set_t>();
+            libc::CPU_ZERO(&mut cpu_set);
+            assert_eq!(
+                libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut cpu_set,),
+                0
+            );
+            (0..libc::CPU_SETSIZE)
+                .find(|&cpu| libc::CPU_ISSET(usize::try_from(cpu).unwrap(), &cpu_set))
+                .expect("the test thread must run on at least one host CPU")
+        }
+    };
+    let mut controller = RuntimeApiController::new(vmm.clone());
+    let mut event_manager = EventManager::new().unwrap();
+    controller
+        .handle_request(
+            VmmAction::HotplugVcpus(HotplugVcpuConfig {
+                add: 1,
+                affinity: vec![VcpuAffinity {
+                    vcpu_id: 1,
+                    host_cpus: vec![u32::try_from(host_cpu).unwrap()],
+                }],
+            }),
+            &mut event_manager,
+        )
+        .unwrap();
+
+    let mut vmm = vmm.lock().unwrap();
+    assert_eq!(vmm.instance_info.state, VmState::Paused);
+    assert_eq!(vmm.machine_config.vcpu_count, 2);
+    assert_eq!(vmm.shutdown_exit_code(), None);
+    let kvm_vm = vmm.vm.as_kvm().unwrap();
+    assert_eq!(kvm_vm.vcpus_handles().len(), 2);
+    assert_eq!(kvm_vm.vcpu_config().unwrap().vcpu_count, 2);
+    vmm.stop(FcExitCode::Ok);
 }
 
 #[test]
@@ -363,8 +409,10 @@ fn verify_load_snapshot(
     snapshot_file: TempFile,
     memory_file: TempFile,
     huge_pages: SnapshotLoadHugePageConfig,
+    vcpu_hotplug: Option<HotplugVcpuConfig>,
 ) {
     let expected_huge_pages = huge_pages.resolve(HugePageConfig::None);
+    let expected_vcpu_count = 1 + vcpu_hotplug.as_ref().map_or(0, |config| config.add);
     let mut event_manager = EventManager::new().unwrap();
     let empty_seccomp_filters = get_empty_filters();
     let mut vm_resources = VmResources::default();
@@ -389,6 +437,7 @@ fn verify_load_snapshot(
             vsock_override: None,
             clock_realtime: false,
             huge_pages,
+            vcpu_hotplug,
         }))
         .unwrap();
 
@@ -398,6 +447,16 @@ fn verify_load_snapshot(
         let vmm = vmm.lock().unwrap();
         assert_eq!(vmm.instance_info.state, VmState::Running);
         assert_eq!(vmm.machine_config.huge_pages, expected_huge_pages);
+        assert_eq!(vmm.machine_config.vcpu_count, expected_vcpu_count);
+        let kvm_vm = vmm.vm.as_kvm().unwrap();
+        assert_eq!(
+            kvm_vm.vcpus_handles().len(),
+            usize::from(expected_vcpu_count)
+        );
+        assert_eq!(
+            kvm_vm.vcpu_config().unwrap().vcpu_count,
+            u8::try_from(expected_vcpu_count).unwrap()
+        );
     }
     vmm.lock().unwrap().stop(FcExitCode::Ok);
 }
@@ -418,6 +477,7 @@ fn test_create_and_load_snapshot() {
                     snapshot_file,
                     memory_file,
                     SnapshotLoadHugePageConfig::Snapshot,
+                    None,
                 );
             }
         }
@@ -432,6 +492,22 @@ fn test_load_snapshot_huge_pages_override() {
         snapshot_file,
         memory_file,
         SnapshotLoadHugePageConfig::Transparent,
+        None,
+    );
+}
+
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn test_load_snapshot_with_additional_vcpus() {
+    let (snapshot_file, memory_file) = verify_create_snapshot(false, false, false);
+    verify_load_snapshot(
+        snapshot_file,
+        memory_file,
+        SnapshotLoadHugePageConfig::Snapshot,
+        Some(HotplugVcpuConfig {
+            add: 2,
+            affinity: vec![],
+        }),
     );
 }
 
@@ -461,6 +537,7 @@ fn test_load_snapshot_rejects_hugetlbfs_with_file_backend() {
             vsock_override: None,
             clock_realtime: false,
             huge_pages: SnapshotLoadHugePageConfig::Hugetlbfs2M,
+            vcpu_hotplug: None,
         }))
         .unwrap_err();
 
@@ -485,6 +562,18 @@ fn test_snapshot_load_sanity_checks() {
 fn check_snapshot(mut microvm_state: MicrovmState) {
     use vmm::persist::SnapShotStateSanityCheckError;
     snapshot_state_sanity_check(&microvm_state).unwrap();
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        let normalized_cpuids = microvm_state.vcpu_config.normalized_cpuids.clone();
+        microvm_state.vcpu_config.normalized_cpuids.pop();
+        assert_eq!(
+            snapshot_state_sanity_check(&microvm_state),
+            Err(SnapShotStateSanityCheckError::VcpuConfigMismatch)
+        );
+        microvm_state.vcpu_config.normalized_cpuids = normalized_cpuids;
+        snapshot_state_sanity_check(&microvm_state).unwrap();
+    }
 
     // Remove memory regions.
     microvm_state.vm_state.memory.regions.clear();
@@ -534,6 +623,7 @@ fn verify_load_snap_disallowed_after_boot_resources(res: VmmAction, res_name: &s
         vsock_override: None,
         clock_realtime: false,
         huge_pages: SnapshotLoadHugePageConfig::Snapshot,
+        vcpu_hotplug: None,
     });
     let err = preboot_api_controller.handle_preboot_request(req);
     assert!(

@@ -1110,6 +1110,7 @@ class Microvm:
         *,
         huge_pages: Optional[HugePagesConfig] = None,
         uffd_handler_name: str = None,
+        vcpu_hotplug: dict = None,
     ):
         """Restore a snapshot"""
         self.backend.require_restore_support()
@@ -1185,6 +1186,9 @@ class Microvm:
         if huge_pages is not None:
             optional_kwargs["huge_pages"] = huge_pages
 
+        if vcpu_hotplug is not None:
+            optional_kwargs["vcpu_hotplug"] = vcpu_hotplug
+
         self.api.snapshot_load.put(
             mem_backend=mem_backend,
             snapshot_path=str(jailed_vmstate),
@@ -1195,6 +1199,9 @@ class Microvm:
 
         if huge_pages is not None:
             self.huge_pages = huge_pages
+
+        if vcpu_hotplug is not None:
+            self.vcpus_count += vcpu_hotplug["add"]
 
         if self.memory_monitor:
             response = self.api.machine_config.get()
