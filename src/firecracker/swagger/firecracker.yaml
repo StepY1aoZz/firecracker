@@ -821,6 +821,33 @@ paths:
           schema:
             $ref: "#/definitions/Error"
 
+  /hotplug/vcpu:
+    patch:
+      summary: Adds vCPUs to a running or paused x86_64 microVM
+      operationId: patchVcpuHotplug
+      description:
+        Appends the requested number of vCPUs and notifies the guest through ACPI.
+        The API completes after the notification, not after the guest has onlined the CPUs.
+        Hot-unplug is not supported.
+      parameters:
+        - name: body
+          in: body
+          description: vCPUs to add and optional host CPU affinity
+          required: true
+          schema:
+            $ref: "#/definitions/VcpuHotplugConfig"
+      responses:
+        204:
+          description: vCPUs added and guest notified
+        400:
+          description: Invalid vCPU count or affinity
+          schema:
+            $ref: "#/definitions/Error"
+        default:
+          description: Internal server error
+          schema:
+            $ref: "#/definitions/Error"
+
   /network-interfaces/{iface_id}:
     put:
       summary: Creates a network interface. Pre-boot only.
@@ -2076,6 +2103,11 @@ definitions:
           memory-mapping behavior. Explicit hugetlbfs (`2M`) pages require a UFFD
           memory backend. With UFFD, the effectiveness of transparent huge pages
           may be limited.
+      vcpu_hotplug:
+        $ref: "#/definitions/VcpuHotplugConfig"
+        description:
+          "[x86_64 only] vCPUs to append while restoring, before the guest is resumed.
+          Affinity IDs are absolute guest vCPU IDs in the newly added range."
 
 
   TokenBucket:
@@ -2146,6 +2178,43 @@ definitions:
           exceed the configured rate are silently dropped and counted in
           the `uart.rate_limiter_dropped_bytes` metric. When absent
           (the default), serial output is not rate-limited.
+
+  VcpuHotplugConfig:
+    type: object
+    description: Number of vCPUs to append and their optional host CPU affinity.
+    required:
+      - add
+    properties:
+      add:
+        type: integer
+        minimum: 1
+        maximum: 32
+        description: Number of vCPUs to append after the current vCPU range.
+      affinity:
+        type: array
+        description: Optional affinity entries for newly added vCPUs.
+        items:
+          $ref: "#/definitions/VcpuAffinity"
+
+  VcpuAffinity:
+    type: object
+    required:
+      - vcpu_id
+      - host_cpus
+    properties:
+      vcpu_id:
+        type: integer
+        minimum: 0
+        maximum: 31
+        description: Absolute zero-based guest vCPU ID.
+      host_cpus:
+        type: array
+        minItems: 1
+        description: Host CPU IDs on which this vCPU thread may run.
+        items:
+          type: integer
+          minimum: 0
+          maximum: 1023
 
   MemoryHotplugConfig:
     type: object

@@ -121,7 +121,7 @@ impl ApiServerAdapter {
                     let req = self.from_api.recv().expect("Error receiving API request.");
                     let req_is_resume = *req == VmmAction::Resume;
                     self._handle_request(*req, event_manager);
-                    if req_is_resume {
+                    if req_is_resume || self.controller.shutdown_exit_code().is_some() {
                         break;
                     }
                 }

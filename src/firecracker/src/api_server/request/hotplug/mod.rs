@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod memory;
+#[cfg(target_arch = "x86_64")]
+pub mod vcpu;
 
 use micro_http::Body;
 use serde::Deserialize;

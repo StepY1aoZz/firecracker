@@ -34,6 +34,8 @@ use crate::api_server::request::hotplug::memory::{
     parse_get_memory_hotplug, parse_patch_memory_hotplug, parse_put_memory_hotplug,
 };
 use crate::api_server::request::hotplug::parse_unplug_device;
+#[cfg(target_arch = "x86_64")]
+use crate::api_server::request::hotplug::vcpu::parse_patch_vcpu_hotplug;
 use crate::api_server::request::serial::parse_put_serial;
 
 #[derive(Debug)]
@@ -127,6 +129,10 @@ impl TryFrom<&Request> for ParsedRequest {
             }
             (Method::Patch, "pmem", Some(body)) => parse_patch_pmem(body, path_tokens.next()),
             (Method::Patch, "vm", Some(body)) => parse_patch_vm_state(body),
+            #[cfg(target_arch = "x86_64")]
+            (Method::Patch, "hotplug", Some(body)) if path_tokens.next() == Some("vcpu") => {
+                parse_patch_vcpu_hotplug(body)
+            }
             (Method::Patch, "hotplug", Some(body)) if path_tokens.next() == Some("memory") => {
                 parse_patch_memory_hotplug(body)
             }

@@ -515,6 +515,108 @@
                 ]
             },
             {
+                "syscall": "ioctl",
+                "comment": "Create vCPUs during runtime hot-add",
+                "args": [{"index": 1, "type": "dword", "op": "eq", "val": 44609, "comment": "KVM_CREATE_VCPU"}]
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "Configure hot-added vCPUs",
+                "args": [{"index": 1, "type": "dword", "op": "eq", "val": 1074310800, "comment": "KVM_SET_CPUID2"}]
+            },
+            {
+                "syscall": "ioctl",
+                "args": [{"index": 1, "type": "dword", "op": "eq", "val": 1074310793, "comment": "KVM_SET_MSRS"}]
+            },
+            {
+                "syscall": "ioctl",
+                "args": [{"index": 1, "type": "dword", "op": "eq", "val": 2214637198, "comment": "KVM_GET_LAPIC"}]
+            },
+            {
+                "syscall": "ioctl",
+                "args": [{"index": 1, "type": "dword", "op": "eq", "val": 1140895375, "comment": "KVM_SET_LAPIC"}]
+            },
+            {
+                "syscall": "ioctl",
+                "args": [{"index": 1, "type": "dword", "op": "eq", "val": 44707, "comment": "KVM_GET_TSC_KHZ"}]
+            },
+            {
+                "syscall": "ioctl",
+                "args": [{"index": 1, "type": "dword", "op": "eq", "val": 44706, "comment": "KVM_SET_TSC_KHZ"}]
+            },
+            {
+                "syscall": "ioctl",
+                "args": [{"index": 1, "type": "dword", "op": "eq", "val": 1075359459, "comment": "KVM_HAS_DEVICE_ATTR for TSC offset synchronization"}]
+            },
+            {
+                "syscall": "ioctl",
+                "args": [{"index": 1, "type": "dword", "op": "eq", "val": 1075359458, "comment": "KVM_GET_DEVICE_ATTR for TSC offset synchronization"}]
+            },
+            {
+                "syscall": "ioctl",
+                "args": [{"index": 1, "type": "dword", "op": "eq", "val": 1075359457, "comment": "KVM_SET_DEVICE_ATTR for TSC offset synchronization"}]
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "The following vCPU ioctls must also be allowed by the inherited VMM filter",
+                "args": [{"index": 1, "type": "dword", "op": "eq", "val": 44672, "comment": "KVM_RUN"}]
+            },
+            {
+                "syscall": "ioctl",
+                "args": [{"index": 1, "type": "dword", "op": "eq", "val": 2147790488, "comment": "KVM_GET_MP_STATE"}]
+            },
+            {
+                "syscall": "ioctl",
+                "args": [{"index": 1, "type": "dword", "op": "eq", "val": 2151722655, "comment": "KVM_GET_VCPU_EVENTS"}]
+            },
+            {
+                "syscall": "ioctl",
+                "args": [{"index": 1, "type": "dword", "op": "eq", "val": 2167975555, "comment": "KVM_GET_SREGS"}]
+            },
+            {
+                "syscall": "ioctl",
+                "args": [{"index": 1, "type": "dword", "op": "eq", "val": 2156965505, "comment": "KVM_GET_REGS"}]
+            },
+            {
+                "syscall": "ioctl",
+                "args": [{"index": 1, "type": "dword", "op": "eq", "val": 3221794440, "comment": "KVM_GET_MSRS"}]
+            },
+            {
+                "syscall": "ioctl",
+                "args": [{"index": 1, "type": "dword", "op": "eq", "val": 3221794449, "comment": "KVM_GET_CPUID2"}]
+            },
+            {
+                "syscall": "ioctl",
+                "args": [{"index": 1, "type": "dword", "op": "eq", "val": 2155916961, "comment": "KVM_GET_DEBUGREGS"}]
+            },
+            {
+                "syscall": "ioctl",
+                "args": [{"index": 1, "type": "dword", "op": "eq", "val": 2415963812, "comment": "KVM_GET_XSAVE"}]
+            },
+            {
+                "syscall": "ioctl",
+                "args": [{"index": 1, "type": "dword", "op": "eq", "val": 2415963855, "comment": "KVM_GET_XSAVE2"}]
+            },
+            {
+                "syscall": "ioctl",
+                "args": [{"index": 1, "type": "dword", "op": "eq", "val": 2173218470, "comment": "KVM_GET_XCRS"}]
+            },
+            {
+                "syscall": "ioctl",
+                "args": [{"index": 1, "type": "dword", "op": "eq", "val": 44717, "comment": "KVM_KVMCLOCK_CTRL"}]
+            },
+            {
+                "syscall": "ioctl",
+                "args": [
+                    {"index": 1, "type": "dword", "op": "eq", "val": 44547, "comment": "KVM_CHECK_EXTENSION"},
+                    {"index": 2, "type": "dword", "op": "eq", "val": 131, "comment": "KVM_CAP_MSI_DEVID"}
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "args": [{"index": 1, "type": "dword", "op": "eq", "val": 1074310762, "comment": "KVM_SET_GSI_ROUTING"}]
+            },
+            {
                 "syscall": "socket",
                 "comment": "Called to open the vsock UDS",
                 "args": [
@@ -948,6 +1050,39 @@
                         "op": {"masked_eq": 4290772991},
                         "val": 4001536,
                         "comment": "Require the pthread clone flags and allow only the optional obsolete CLONE_DETACHED bit"
+                    }
+                ]
+            },
+            {
+                "syscall": "rt_sigaction",
+                "comment": "Used to install the kick handler in vCPU threads spawned after VMM seccomp is active",
+                "args": [
+                    {
+                        "index": 0,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 35,
+                        "comment": "sigrtmin() + vcpu::VCPU_RTSIG_OFFSET"
+                    }
+                ]
+            },
+            {
+                "syscall": "sched_setaffinity",
+                "comment": "Used to pin newly created vCPU threads before their first KVM_RUN",
+                "args": [
+                    {
+                        "index": 0,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 0,
+                        "comment": "Current thread"
+                    },
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 128,
+                        "comment": "sizeof(cpu_set_t)"
                     }
                 ]
             },
