@@ -96,7 +96,7 @@ pub fn configure_system_for_boot(
     entry_point: EntryPoint,
     initrd: &Option<InitrdConfig>,
     boot_cmdline: Cmdline,
-) -> Result<(), ConfigurationError> {
+) -> Result<VcpuConfig, ConfigurationError> {
     // Construct the base CpuConfiguration to apply CPU template onto.
     let cpu_config = CpuConfiguration::new(cpu_template, vcpus)?;
 
@@ -157,7 +157,7 @@ pub fn configure_system_for_boot(
     let fdt_address = GuestAddress(get_fdt_addr(vm.guest_memory()));
     vm.guest_memory().write_slice(fdt.as_slice(), fdt_address)?;
 
-    Ok(())
+    Ok(vcpu_config)
 }
 
 /// Override CLIDR_EL1 ctype/LoC fields on each vCPU to match the host's real

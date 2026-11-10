@@ -30,7 +30,7 @@ use crate::cpu_config::x86_64::{CpuConfiguration, cpuid};
 use crate::logger::{IncMetric, METRICS, error, warn};
 use crate::vstate::bus::Bus;
 use crate::vstate::memory::GuestMemoryMmap;
-use crate::vstate::vcpu::{VcpuEmulation, VcpuError};
+use crate::vstate::vcpu::{VcpuConfig, VcpuEmulation, VcpuError};
 use crate::vstate::vm::KvmVm;
 
 // Tolerance for TSC frequency expected variation.
@@ -147,6 +147,8 @@ pub enum KvmVcpuConfigureError {
     SetupFpu(#[from] SetupFpuError),
     /// Failed to setup special registers: {0}
     SetupSpecialRegisters(#[from] SetupSpecialRegistersError),
+    /// Normalized CPUID is unavailable for vCPU {0}
+    MissingNormalizedCpuid(u8),
     /// Failed to configure LAPICs: {0}
     SetLint(#[from] interrupts::InterruptError),
 }
@@ -176,6 +178,47 @@ pub struct Peripherals {
     pub pio_bus: Option<Arc<Bus>>,
     /// Mmio bus.
     pub mmio_bus: Option<Arc<Bus>>,
+}
+
+pub(crate) fn supports_tsc_offset_attr(fd: &VcpuFd) -> bool {
+    let attr = kvm_device_attr {
+        group: KVM_VCPU_TSC_CTRL,
+        attr: u64::from(KVM_VCPU_TSC_OFFSET),
+        ..Default::default()
+    };
+    // SAFETY: The vCPU fd and attribute are valid, and HAS_DEVICE_ATTR ignores addr.
+    unsafe { ioctl_with_ref(fd, ioctls::KVM_HAS_DEVICE_ATTR(), &attr) == 0 }
+}
+
+pub(crate) fn get_tsc_offset(fd: &VcpuFd) -> Result<i64, errno::Error> {
+    let mut offset = 0_i64;
+    let attr = kvm_device_attr {
+        group: KVM_VCPU_TSC_CTRL,
+        attr: u64::from(KVM_VCPU_TSC_OFFSET),
+        addr: std::ptr::from_mut(&mut offset) as u64,
+        ..Default::default()
+    };
+    // SAFETY: The attribute points to a writable i64 that lives through the ioctl.
+    let ret = unsafe { ioctl_with_ref(fd, ioctls::KVM_GET_DEVICE_ATTR(), &attr) };
+    if ret != 0 {
+        return Err(errno::Error::last());
+    }
+    Ok(offset)
+}
+
+pub(crate) fn set_tsc_offset(fd: &VcpuFd, offset: i64) -> Result<(), errno::Error> {
+    let attr = kvm_device_attr {
+        group: KVM_VCPU_TSC_CTRL,
+        attr: u64::from(KVM_VCPU_TSC_OFFSET),
+        addr: std::ptr::from_ref(&offset) as u64,
+        ..Default::default()
+    };
+    // SAFETY: The attribute points to a readable i64 that lives through the ioctl.
+    let ret = unsafe { ioctl_with_ref(fd, ioctls::KVM_SET_DEVICE_ATTR(), &attr) };
+    if ret != 0 {
+        return Err(errno::Error::last());
+    }
+    Ok(())
 }
 
 impl KvmVcpu {
@@ -219,22 +262,28 @@ impl KvmVcpu {
         vcpu_count: u8,
         smt: bool,
     ) -> Result<CpuId, KvmVcpuConfigureError> {
+        let cpuid = Self::normalize_cpuid(self.index, cpuid, vcpu_count, smt)?;
+        self.install_cpuid(&cpuid)
+    }
+
+    /// Normalizes a templated CPUID for one vCPU without accessing KVM state.
+    pub fn normalize_cpuid(
+        cpu_index: u8,
+        cpuid: &cpuid::Cpuid,
+        vcpu_count: u8,
+        smt: bool,
+    ) -> Result<cpuid::Cpuid, KvmVcpuConfigureError> {
         let mut cpuid = cpuid.clone();
+        cpuid.normalize(cpu_index, vcpu_count, u8::from(vcpu_count > 1 && smt))?;
+        Ok(cpuid)
+    }
 
-        cpuid.normalize(
-            // The index of the current logical CPU in the range [0..cpu_count].
-            self.index,
-            // The total number of logical CPUs.
-            vcpu_count,
-            // The number of bits needed to enumerate logical CPUs per core.
-            u8::from(vcpu_count > 1 && smt),
-        )?;
-
-        let kvm_cpuid = CpuId::try_from(cpuid)?;
+    /// Installs an already normalized CPUID on this vCPU.
+    pub fn install_cpuid(&self, cpuid: &cpuid::Cpuid) -> Result<CpuId, KvmVcpuConfigureError> {
+        let kvm_cpuid = CpuId::try_from(cpuid.clone())?;
         self.fd
             .set_cpuid2(&kvm_cpuid)
             .map_err(KvmVcpuConfigureError::SetCpuid)?;
-
         Ok(kvm_cpuid)
     }
 
@@ -256,11 +305,18 @@ impl KvmVcpu {
         configured_cpuid: &CpuId,
     ) -> Result<(), KvmVcpuConfigureError> {
         let mut msrs = msrs.clone();
-        self.msrs_to_save.extend(msrs.keys());
-
         create_boot_msr_entries().into_iter().for_each(|entry| {
             msrs.insert(entry.index, entry.data);
         });
+        self.configure_msrs_common(&msrs, configured_cpuid)
+    }
+
+    fn configure_msrs_common(
+        &mut self,
+        msrs: &BTreeMap<u32, u64>,
+        configured_cpuid: &CpuId,
+    ) -> Result<(), KvmVcpuConfigureError> {
+        self.msrs_to_save.extend(msrs.keys());
 
         // TODO - Add/amend MSRs for vCPUs based on cpu_config
         // By this point the Guest CPUID is established. Some CPU features require MSRs
@@ -281,10 +337,10 @@ impl KvmVcpu {
         self.msrs_to_save.extend(extra_msrs);
 
         let kvm_msrs = msrs
-            .into_iter()
-            .map(|entry| kvm_bindings::kvm_msr_entry {
-                index: entry.0,
-                data: entry.1,
+            .iter()
+            .map(|(&index, &data)| kvm_bindings::kvm_msr_entry {
+                index,
+                data,
                 ..Default::default()
             })
             .collect::<Vec<_>>();
@@ -311,6 +367,26 @@ impl KvmVcpu {
         crate::arch::x86_64::regs::setup_regs(&self.fd, kernel_entry_point)?;
         crate::arch::x86_64::regs::setup_fpu(&self.fd)?;
         crate::arch::x86_64::regs::setup_sregs(guest_mem, &self.fd, kernel_entry_point.protocol)?;
+        crate::arch::x86_64::interrupts::set_lint(&self.fd)?;
+        Ok(())
+    }
+
+    /// Configures a vCPU added after boot without installing Linux kernel-entry state.
+    pub fn hotplug_configure(&mut self, config: &VcpuConfig) -> Result<(), KvmVcpuConfigureError> {
+        let normalized_cpuid = config
+            .normalized_cpuids
+            .get(usize::from(self.index))
+            .ok_or(KvmVcpuConfigureError::MissingNormalizedCpuid(self.index))?;
+        let configured_cpuid = self.install_cpuid(normalized_cpuid)?;
+        let mut msrs = config.cpu_config.msrs.clone();
+        create_boot_msr_entries()
+            .into_iter()
+            .filter(|entry| entry.index != MSR_IA32_TSC)
+            .for_each(|entry| {
+                msrs.insert(entry.index, entry.data);
+            });
+        msrs.remove(&MSR_IA32_TSC);
+        self.configure_msrs_common(&msrs, &configured_cpuid)?;
         crate::arch::x86_64::interrupts::set_lint(&self.fd)?;
         Ok(())
     }
@@ -404,46 +480,17 @@ impl KvmVcpu {
 
     /// Whether KVM supports directly accessing this vCPU's TSC offset.
     pub fn supports_tsc_offset_attr(&self) -> bool {
-        let attr = kvm_device_attr {
-            group: KVM_VCPU_TSC_CTRL,
-            attr: u64::from(KVM_VCPU_TSC_OFFSET),
-            ..Default::default()
-        };
-        // SAFETY: The vCPU fd and attribute are valid, and HAS_DEVICE_ATTR ignores addr.
-        unsafe { ioctl_with_ref(&self.fd, ioctls::KVM_HAS_DEVICE_ATTR(), &attr) == 0 }
+        supports_tsc_offset_attr(&self.fd)
     }
 
     /// Read this vCPU's TSC offset relative to the host TSC.
     pub fn get_tsc_offset(&self) -> Result<i64, errno::Error> {
-        let mut offset = 0_i64;
-        let attr = kvm_device_attr {
-            group: KVM_VCPU_TSC_CTRL,
-            attr: u64::from(KVM_VCPU_TSC_OFFSET),
-            addr: std::ptr::from_mut(&mut offset) as u64,
-            ..Default::default()
-        };
-        // SAFETY: The attribute points to a writable i64 that lives through the ioctl.
-        let ret = unsafe { ioctl_with_ref(&self.fd, ioctls::KVM_GET_DEVICE_ATTR(), &attr) };
-        if ret != 0 {
-            return Err(errno::Error::last());
-        }
-        Ok(offset)
+        get_tsc_offset(&self.fd)
     }
 
     /// Set this vCPU's TSC offset while the vCPU is not running.
     pub fn set_tsc_offset(&self, offset: i64) -> Result<(), errno::Error> {
-        let attr = kvm_device_attr {
-            group: KVM_VCPU_TSC_CTRL,
-            attr: u64::from(KVM_VCPU_TSC_OFFSET),
-            addr: std::ptr::from_ref(&offset) as u64,
-            ..Default::default()
-        };
-        // SAFETY: The attribute points to a readable i64 that lives through the ioctl.
-        let ret = unsafe { ioctl_with_ref(&self.fd, ioctls::KVM_SET_DEVICE_ATTR(), &attr) };
-        if ret != 0 {
-            return Err(errno::Error::last());
-        }
-        Ok(())
+        set_tsc_offset(&self.fd, offset)
     }
 
     /// Get CPUID for this vCPU.
@@ -906,6 +953,9 @@ pub(crate) mod tests {
     use super::*;
     use crate::arch::BootProtocol;
     use crate::arch::x86_64::cpu_model::CpuModel;
+    use crate::arch::x86_64::generated::msr_index::{
+        MSR_IA32_MISC_ENABLE, MSR_IA32_MISC_ENABLE_FAST_STRING, MSR_MTRRdefType,
+    };
     use crate::cpu_config::templates::{
         CpuTemplateType, CustomCpuTemplate, GetCpuTemplate, StaticCpuTemplate,
     };
@@ -1094,6 +1144,60 @@ pub(crate) mod tests {
                 assert!(!t2a_res);
             }
         }
+    }
+
+    #[test]
+    fn test_hotplug_configure_uses_normalized_cpuid_and_boot_msrs() {
+        let (vm, _boot_vcpu) = setup_vcpu(0x10000);
+        let cpuid = Cpuid::try_from(vm.kvm().supported_cpuid.clone()).unwrap();
+        let possible_vcpus = u8::try_from(crate::vstate::vm::MAX_SUPPORTED_KVM_VCPUS).unwrap();
+        let normalized_cpuids = (0..possible_vcpus)
+            .map(|index| KvmVcpu::normalize_cpuid(index, &cpuid, possible_vcpus, false))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let expected_cpuid = normalized_cpuids[1].clone();
+        let mut config = VcpuConfig {
+            vcpu_count: 1,
+            smt: false,
+            cpu_config: CpuConfiguration {
+                cpuid,
+                msrs: BTreeMap::new(),
+            },
+            normalized_cpuids,
+        };
+        config
+            .cpu_config
+            .cpuid
+            .inner_mut()
+            .get_mut(&CpuidKey {
+                leaf: 3,
+                subleaf: 0,
+            })
+            .unwrap()
+            .result
+            .eax = 0x1234_5678;
+        config.cpu_config.msrs.insert(MSR_IA32_MISC_ENABLE, 0);
+        config.cpu_config.msrs.insert(MSR_MTRRdefType, 0);
+        config.cpu_config.msrs.insert(MSR_IA32_TSC, 0);
+
+        let mut hotplugged_vcpu = KvmVcpu::new(1, &vm).unwrap();
+        hotplugged_vcpu.hotplug_configure(&config).unwrap();
+        let reference_vcpu = KvmVcpu::new(2, &vm).unwrap();
+        reference_vcpu.install_cpuid(&expected_cpuid).unwrap();
+
+        // KVM canonicalizes XSAVE size fields while installing CPUID.
+        let installed_cpuid = Cpuid::try_from(hotplugged_vcpu.get_cpuid().unwrap()).unwrap();
+        let reference_cpuid = Cpuid::try_from(reference_vcpu.get_cpuid().unwrap()).unwrap();
+        assert_eq!(installed_cpuid, reference_cpuid);
+
+        let msrs = hotplugged_vcpu
+            .get_msrs([MSR_IA32_MISC_ENABLE, MSR_MTRRdefType].into_iter())
+            .unwrap();
+        assert_eq!(
+            msrs[&MSR_IA32_MISC_ENABLE],
+            u64::from(MSR_IA32_MISC_ENABLE_FAST_STRING)
+        );
+        assert_eq!(msrs[&MSR_MTRRdefType], (1 << 11) | 0x6);
     }
 
     #[test]

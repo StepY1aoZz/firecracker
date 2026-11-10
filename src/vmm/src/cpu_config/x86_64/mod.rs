@@ -30,7 +30,7 @@ pub enum CpuConfigurationError {
 }
 
 /// CPU configuration for x86_64 CPUs
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CpuConfiguration {
     /// CPUID configuration
     pub cpuid: Cpuid,
@@ -38,6 +38,15 @@ pub struct CpuConfiguration {
     /// Key: MSR address
     /// Value: MSR value
     pub msrs: BTreeMap<u32, u64>,
+}
+
+impl Default for CpuConfiguration {
+    fn default() -> Self {
+        Self {
+            cpuid: Cpuid::Intel(cpuid::IntelCpuid(BTreeMap::new())),
+            msrs: BTreeMap::new(),
+        }
+    }
 }
 
 /// Applies the CPUID modifiers from a CPU template.

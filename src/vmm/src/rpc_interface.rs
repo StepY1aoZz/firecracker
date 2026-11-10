@@ -10,7 +10,7 @@ use utils::time::{ClockType, get_time_us};
 use super::builder::{StartMicrovmError, build_and_boot_microvm};
 use super::persist::{create_snapshot, restore_from_snapshot};
 use super::resources::VmResources;
-use super::{Vmm, VmmError};
+use super::{FcExitCode, Vmm, VmmError};
 use crate::EventManager;
 use crate::cpu_config::templates::{CustomCpuTemplate, GuestConfigError};
 use crate::device_manager::pci_mngr::PciManagerError;
@@ -44,6 +44,8 @@ use crate::vmm_config::net::{
 use crate::vmm_config::pmem::{PmemConfig, PmemConfigError, PmemDeviceUpdateConfig};
 use crate::vmm_config::serial::SerialConfig;
 use crate::vmm_config::snapshot::{CreateSnapshotParams, LoadSnapshotParams, SnapshotType};
+#[cfg(target_arch = "x86_64")]
+use crate::vmm_config::vcpu_hotplug::HotplugVcpuConfig;
 use crate::vmm_config::vsock::{VsockConfigError, VsockDeviceConfig};
 use crate::vmm_config::{self, RateLimiterUpdate};
 
@@ -161,6 +163,9 @@ pub enum VmmAction {
     UpdateMachineConfiguration(MachineConfigUpdate),
     /// Hot-unplug a device.
     HotUnplugDevice(VirtioDeviceId, bool),
+    /// Add vCPUs to a running or paused x86_64 microVM.
+    #[cfg(target_arch = "x86_64")]
+    HotplugVcpus(HotplugVcpuConfig),
 }
 
 /// Wrapper for all errors associated with VMM actions.
@@ -188,6 +193,9 @@ pub enum VmmActionError {
     MemoryHotplugUpdate(VmmError),
     /// Internal VMM error: {0}
     InternalVmm(#[from] VmmError),
+    /// vCPU hot-add error: {0}
+    #[cfg(target_arch = "x86_64")]
+    HotplugVcpus(#[from] crate::HotplugVcpuError),
     /// Load snapshot error: {0}
     LoadSnapshot(#[from] LoadSnapshotError),
     /// Logger error: {0}
@@ -542,6 +550,8 @@ impl<'a> PrebootApiController<'a> {
             | StopFreePageHinting
             | HotUnplugDevice(..)
             | SendCtrlAltDel => Err(VmmActionError::OperationNotSupportedPreBoot),
+            #[cfg(target_arch = "x86_64")]
+            HotplugVcpus(_) => Err(VmmActionError::OperationNotSupportedPreBoot),
         }
     }
 
@@ -834,6 +844,14 @@ impl RuntimeApiController {
                 .expect("Poisoned lock")
                 .hot_unplug_device(device_id, event_manager, force)
                 .map(|()| VmmData::Empty),
+            #[cfg(target_arch = "x86_64")]
+            HotplugVcpus(config) => self
+                .vmm
+                .lock()
+                .expect("Poisoned lock")
+                .hotplug_vcpus(config)
+                .map(|()| VmmData::Empty)
+                .map_err(VmmActionError::HotplugVcpus),
             Pause => self.pause(),
             PutMMDS(value) => mmds_put_data(
                 self.vmm
@@ -923,6 +941,11 @@ impl RuntimeApiController {
     /// Creates a new `RuntimeApiController`.
     pub fn new(vmm: Arc<Mutex<Vmm>>) -> Self {
         Self { vmm }
+    }
+
+    /// Returns the VM's pending fatal or clean shutdown code.
+    pub fn shutdown_exit_code(&self) -> Option<FcExitCode> {
+        self.vmm.lock().expect("Poisoned lock").shutdown_exit_code()
     }
 
     /// Tears down the devices whose removal the guest has acknowledged.
@@ -1423,6 +1446,7 @@ mod tests {
                 vsock_override: None,
                 clock_realtime: false,
                 huge_pages: SnapshotLoadHugePageConfig::Snapshot,
+                vcpu_hotplug: None,
             },
         )));
         check_unsupported(runtime_request(VmmAction::SetEntropyDevice(

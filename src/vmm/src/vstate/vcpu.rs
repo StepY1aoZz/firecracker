@@ -6,15 +6,16 @@
 // found in the THIRD-PARTY file.
 
 use std::os::fd::AsRawFd;
+use std::sync::Arc;
 use std::sync::atomic::{Ordering, fence};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel};
-use std::sync::{Arc, Barrier};
 use std::time::Duration;
 use std::{fmt, io, thread};
 
 use kvm_bindings::{KVM_SYSTEM_EVENT_RESET, KVM_SYSTEM_EVENT_SHUTDOWN};
 use kvm_ioctls::{VcpuExit, VcpuFd};
 use libc::{c_int, c_void, siginfo_t};
+use serde::{Deserialize, Serialize};
 use vmm_sys_util::errno;
 use vmm_sys_util::eventfd::EventFd;
 
@@ -50,6 +51,10 @@ pub enum VcpuError {
     VcpuResponse(KvmVcpuError),
     /// Cannot spawn a new vCPU thread: {0}
     VcpuSpawn(io::Error),
+    /// Failed to apply vCPU seccomp filter: {0}
+    Seccomp(crate::seccomp::InstallationError),
+    /// Failed to apply host CPU affinity: {0}
+    Affinity(io::Error),
     /// Vcpu not present in TLS
     VcpuTlsNotPresent,
     /// Error with gdb request sent
@@ -58,7 +63,8 @@ pub enum VcpuError {
 }
 
 /// Encapsulates configuration parameters for the guest vCPUS.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(target_arch = "x86_64", derive(Serialize, Deserialize))]
 pub struct VcpuConfig {
     /// Number of guest VCPUs.
     pub vcpu_count: u8,
@@ -66,6 +72,30 @@ pub struct VcpuConfig {
     pub smt: bool,
     /// Configuration for vCPU
     pub cpu_config: CpuConfiguration,
+    /// Host-independent CPUID for every possible vCPU, indexed by vCPU ID.
+    #[cfg(target_arch = "x86_64")]
+    pub normalized_cpuids: Vec<crate::cpu_config::x86_64::cpuid::Cpuid>,
+}
+
+impl Default for VcpuConfig {
+    fn default() -> Self {
+        Self {
+            vcpu_count: 1,
+            smt: false,
+            cpu_config: CpuConfiguration::default(),
+            #[cfg(target_arch = "x86_64")]
+            normalized_cpuids: Vec::new(),
+        }
+    }
+}
+
+/// Host CPUs on which a vCPU thread is allowed to run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VcpuAffinity {
+    /// Zero-based guest vCPU index.
+    pub vcpu_id: u8,
+    /// Host CPU indices. An empty list is invalid.
+    pub host_cpus: Vec<u32>,
 }
 
 /// Error type for [`Vcpu::start_threaded`].
@@ -75,12 +105,16 @@ pub enum StartThreadedError {
     Spawn(std::io::Error),
     /// Failed to clone kvm Vcpu fd: {0}
     CopyFd(CopyKvmFdError),
+    /// vCPU thread initialization failed: {0}
+    Initialization(VcpuError),
+    /// Failed while waiting for vCPU thread initialization: {0}
+    StartupChannel(RecvTimeoutError),
 }
 
 /// Error type for [`Vcpu::copy_kvm_vcpu_fd`].
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum CopyKvmFdError {
-    /// Error with libc dup of kvm Vcpu fd
+    /// Error duplicating the KVM vCPU fd
     DupError(#[from] std::io::Error),
     /// Error creating the Vcpu from the duplicated Vcpu fd
     CreateVcpuError(#[from] kvm_ioctls::Error),
@@ -141,7 +175,7 @@ impl Vcpu {
     pub fn new(index: u8, vm: &KvmVm, exit_evt: EventFd) -> Result<Self, VcpuError> {
         let (event_sender, event_receiver) = channel();
         let (response_sender, response_receiver) = channel();
-        let kvm_vcpu = KvmVcpu::new(index, vm).unwrap();
+        let kvm_vcpu = KvmVcpu::new(index, vm).map_err(VcpuError::VcpuResponse)?;
 
         Ok(Vcpu {
             exit_evt,
@@ -169,11 +203,11 @@ impl Vcpu {
     /// Obtains a copy of the VcpuFd
     pub fn copy_kvm_vcpu_fd(&self, vm: &KvmVm) -> Result<VcpuFd, CopyKvmFdError> {
         // SAFETY: We own this fd so it is considered safe to clone
-        let r = unsafe { libc::dup(self.kvm_vcpu.fd.as_raw_fd()) };
+        let r = unsafe { libc::fcntl(self.kvm_vcpu.fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
         if r < 0 {
             return Err(std::io::Error::last_os_error().into());
         }
-        // SAFETY: We assert this is a valid fd by checking the result from the dup
+        // SAFETY: We assert this is a valid fd by checking the result from the duplication
         unsafe { Ok(vm.fd().create_vcpu_from_rawfd(r)?) }
     }
 
@@ -183,30 +217,74 @@ impl Vcpu {
         mut self,
         vm: &KvmVm,
         seccomp_filter: Arc<BpfProgram>,
-        barrier: Arc<Barrier>,
+        affinity: Option<Vec<u32>>,
     ) -> Result<VcpuHandle, StartThreadedError> {
         let event_sender = self.event_sender.take().expect("vCPU already started");
         let response_receiver = self.response_receiver.take().unwrap();
+        let (startup_sender, startup_receiver) = channel();
         let vcpu_fd = self
             .copy_kvm_vcpu_fd(vm)
             .map_err(StartThreadedError::CopyFd)?;
         let vcpu_thread = thread::Builder::new()
             .name(format!("fc_vcpu {}", self.kvm_vcpu.index))
             .spawn(move || {
-                let filter = &*seccomp_filter;
                 self.register_kick_signal_handler();
-                // Synchronization to make sure thread local data is initialized.
-                barrier.wait();
-                self.run(filter);
+                let result = self.initialize(&seccomp_filter, affinity.as_deref());
+                let initialized = result.is_ok();
+                if startup_sender.send(result).is_err() || !initialized {
+                    return;
+                }
+                self.run_loop();
             })
             .map_err(StartThreadedError::Spawn)?;
 
         Ok(VcpuHandle::new(
             event_sender,
             response_receiver,
+            startup_receiver,
             vcpu_fd,
             vcpu_thread,
         ))
+    }
+
+    fn apply_affinity(host_cpus: &[u32]) -> Result<(), VcpuError> {
+        if host_cpus.is_empty() {
+            return Err(VcpuError::Affinity(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "host CPU set cannot be empty",
+            )));
+        }
+
+        // SAFETY: cpu_set_t is plain-old-data, CPU_ZERO initializes it, and every CPU_SET index
+        // is checked against CPU_SETSIZE. sched_setaffinity receives a valid pointer and size.
+        unsafe {
+            let mut cpu_set = std::mem::zeroed::<libc::cpu_set_t>();
+            libc::CPU_ZERO(&mut cpu_set);
+            for &cpu in host_cpus {
+                if cpu >= u32::try_from(libc::CPU_SETSIZE).expect("CPU_SETSIZE is positive") {
+                    return Err(VcpuError::Affinity(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("host CPU {cpu} exceeds CPU_SETSIZE"),
+                    )));
+                }
+                libc::CPU_SET(cpu as usize, &mut cpu_set);
+            }
+            if libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &cpu_set) != 0 {
+                return Err(VcpuError::Affinity(io::Error::last_os_error()));
+            }
+        }
+        Ok(())
+    }
+
+    fn initialize(
+        &self,
+        seccomp_filter: BpfProgramRef,
+        affinity: Option<&[u32]>,
+    ) -> Result<(), VcpuError> {
+        if let Some(host_cpus) = affinity {
+            Self::apply_affinity(host_cpus)?;
+        }
+        crate::seccomp::apply_filter(seccomp_filter).map_err(VcpuError::Seccomp)
     }
 
     /// Main loop of the vCPU thread.
@@ -215,16 +293,16 @@ impl Vcpu {
     /// Note that the state of the VCPU and associated VM must be setup first for this to do
     /// anything useful.
     pub fn run(&mut self, seccomp_filter: BpfProgramRef) {
-        // Load seccomp filters for this vCPU thread.
-        // Execution panics if filters cannot be loaded, use --no-seccomp if skipping filters
-        // altogether is the desired behaviour.
-        if let Err(err) = crate::seccomp::apply_filter(seccomp_filter) {
+        if let Err(err) = self.initialize(seccomp_filter, None) {
             panic!(
-                "Failed to set the requested seccomp filters on vCPU {}: Error: {}",
+                "Failed to initialize vCPU {}: Error: {}",
                 self.kvm_vcpu.index, err
             );
         }
+        self.run_loop();
+    }
 
+    fn run_loop(&mut self) {
         // Start running the machine state in the `Paused` state.
         let mut state = VcpuRunState::Paused;
         loop {
@@ -576,6 +654,7 @@ impl fmt::Debug for VcpuResponse {
 pub struct VcpuHandle {
     event_sender: Sender<VcpuEvent>,
     response_receiver: Receiver<VcpuResponse>,
+    startup_receiver: Receiver<Result<(), VcpuError>>,
     /// VcpuFd
     pub vcpu_fd: VcpuFd,
     // Rust JoinHandles have to be wrapped in Option if you ever plan on 'join()'ing them.
@@ -598,12 +677,14 @@ impl VcpuHandle {
     pub fn new(
         event_sender: Sender<VcpuEvent>,
         response_receiver: Receiver<VcpuResponse>,
+        startup_receiver: Receiver<Result<(), VcpuError>>,
         vcpu_fd: VcpuFd,
         vcpu_thread: thread::JoinHandle<()>,
     ) -> Self {
         Self {
             event_sender,
             response_receiver,
+            startup_receiver,
             vcpu_fd,
             vcpu_thread: Some(vcpu_thread),
         }
@@ -633,6 +714,22 @@ impl VcpuHandle {
     /// Returns a reference to the [`Received`] from which the vcpu's responses can be read.
     pub fn response_receiver(&self) -> &Receiver<VcpuResponse> {
         &self.response_receiver
+    }
+
+    pub(crate) fn wait_for_startup(&self) -> Result<(), StartThreadedError> {
+        match self
+            .startup_receiver
+            .recv_timeout(crate::RECV_TIMEOUT_SEC)
+            .map_err(StartThreadedError::StartupChannel)?
+        {
+            Ok(()) => Ok(()),
+            Err(err) => Err(StartThreadedError::Initialization(err)),
+        }
+    }
+
+    pub(crate) fn finish_staged(&self) {
+        // Staged vCPUs have not been resumed, so no signal is needed to wake them.
+        let _ = self.event_sender.send(VcpuEvent::Finish);
     }
 }
 
@@ -940,16 +1037,10 @@ pub(crate) mod tests {
             .expect("failed to configure vcpu");
 
         let mut seccomp_filters = get_empty_filters();
-        let barrier = Arc::new(Barrier::new(2));
         let vcpu_handle = vcpu
-            .start_threaded(
-                &vm,
-                seccomp_filters.remove("vcpu").unwrap(),
-                barrier.clone(),
-            )
+            .start_threaded(&vm, seccomp_filters.remove("vcpu").unwrap(), None)
             .expect("failed to start vcpu");
-        // Wait for vCPUs to initialize their TLS before moving forward.
-        barrier.wait();
+        vcpu_handle.wait_for_startup().unwrap();
 
         (vm, vcpu_handle, vcpu_exit_evt)
     }

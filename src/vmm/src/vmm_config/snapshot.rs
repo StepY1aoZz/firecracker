@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use super::machine_config::HugePageConfig;
+use super::vcpu_hotplug::HotplugVcpuConfig;
 
 /// The snapshot type options that are available when
 /// creating a new snapshot.
@@ -124,6 +125,8 @@ pub struct LoadSnapshotParams {
     pub clock_realtime: bool,
     /// Selects the huge-page configuration to use for the restored microVM.
     pub huge_pages: SnapshotLoadHugePageConfig,
+    /// vCPUs to add before the restored guest is resumed.
+    pub vcpu_hotplug: Option<HotplugVcpuConfig>,
 }
 
 /// Stores the configuration for loading a snapshot that is provided by the user.
@@ -162,6 +165,9 @@ pub struct LoadSnapshotConfig {
     /// Selects the huge-page configuration to use for the restored microVM.
     #[serde(default)]
     pub huge_pages: SnapshotLoadHugePageConfig,
+    /// vCPUs to add before the restored guest is resumed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vcpu_hotplug: Option<HotplugVcpuConfig>,
 }
 
 /// Stores the configuration used for managing snapshot memory.

@@ -3,6 +3,7 @@
 
 //! Enables pre-boot setup, instantiation and booting of a Firecracker VMM.
 
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::io;
 #[cfg(feature = "gdb")]
@@ -341,7 +342,7 @@ pub fn build_microvm_for_boot(
         warn!("Vcpus do not support pvtime, steal time will not be reported to guest");
     }
 
-    configure_system_for_boot(
+    let vcpu_config = configure_system_for_boot(
         kvm_vm.kvm(),
         &kvm_vm,
         &mut device_manager,
@@ -353,6 +354,7 @@ pub fn build_microvm_for_boot(
         &initrd,
         boot_cmdline,
     )?;
+    kvm_vm.set_vcpu_config(vcpu_config);
 
     let vmm = Vmm {
         instance_info: instance_info.clone(),
@@ -380,6 +382,7 @@ pub fn build_microvm_for_boot(
                 .get("vcpu")
                 .ok_or_else(|| StartMicrovmError::MissingSeccompFilters("vcpu".to_string()))?
                 .clone(),
+            &std::collections::HashMap::new(),
         )
         .map_err(VmmError::VcpuStart)?;
     vmm.lock().unwrap().instance_info.state = VmState::Paused;
@@ -447,8 +450,14 @@ pub enum BuildMicrovmFromSnapshotError {
     StartVcpus(#[from] crate::StartVcpusError),
     /// Failed to restore vCPUs: {0}
     RestoreVcpus(#[from] VcpuError),
+    /// Failed to configure additional vCPUs: {0}
+    #[cfg(target_arch = "x86_64")]
+    ConfigureHotplugVcpus(#[from] crate::vstate::vcpu::KvmVcpuConfigureError),
     /// Failed to restore devices: {0}
     RestoreDevices(#[from] DeviceManagerPersistError),
+    /// Failed to notify the guest about additional vCPUs: {0}
+    #[cfg(target_arch = "x86_64")]
+    NotifyCpuContainer(crate::devices::acpi::cpu_container::CpuContainerError),
     /// clock_realtime is not supported on aarch64.
     UnsupportedClockRealtime,
 }
@@ -502,18 +511,27 @@ pub fn build_microvm_from_snapshot(
     seccomp_filters: &BpfThreadMap,
     vm_resources: &mut VmResources,
     clock_realtime: bool,
+    vcpu_affinities: &HashMap<u8, Vec<u32>>,
 ) -> Result<Arc<Mutex<Vmm>>, BuildMicrovmFromSnapshotError> {
     // Build Vmm.
     debug!("event_start: build microvm from snapshot");
 
     // Reject an out-of-range vCPU count before doing any work for the restore.
     let vcpu_count = kvm_vcpu_count(&vm_resources.machine_config)?;
+    #[cfg(target_arch = "x86_64")]
+    let restored_vcpu_count = microvm_state.vcpu_states.len();
 
     let kvm = Kvm::new(microvm_state.kvm_state.kvm_cap_modifiers.clone())
         .map_err(StartMicrovmError::Kvm)?;
     // Set up KVM VM and register memory regions.
     // Build custom CPU config if a custom template is provided.
     let mut vm = KvmVm::new(kvm).map_err(StartMicrovmError::KvmVm)?;
+    #[cfg(target_arch = "x86_64")]
+    {
+        let mut vcpu_config = microvm_state.vcpu_config.clone();
+        vcpu_config.vcpu_count = vcpu_count;
+        vm.set_vcpu_config(vcpu_config);
+    }
 
     let mut vcpus = vm
         .create_vcpus(vcpu_count)
@@ -542,6 +560,12 @@ pub fn build_microvm_from_snapshot(
             .restore_state(state)
             .map_err(VcpuError::VcpuResponse)
             .map_err(BuildMicrovmFromSnapshotError::RestoreVcpus)?;
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    for vcpu in &mut vcpus[restored_vcpu_count..] {
+        vcpu.kvm_vcpu
+            .hotplug_configure(&microvm_state.vcpu_config)?;
     }
 
     // Restoring TSC MSRs separately can leave different offsets on each vCPU.
@@ -588,6 +612,17 @@ pub fn build_microvm_from_snapshot(
     #[allow(unused_mut)]
     let mut device_manager =
         DeviceManager::restore(device_ctor_args, &microvm_state.device_states)?;
+    #[cfg(target_arch = "x86_64")]
+    if restored_vcpu_count < vcpus.len() {
+        let first_new = u8::try_from(restored_vcpu_count).expect("validated vCPU count fits in u8");
+        device_manager
+            .hot_add_vcpus(first_new..vcpu_count)
+            .map_err(BuildMicrovmFromSnapshotError::NotifyCpuContainer)?;
+    } else {
+        device_manager
+            .notify_pending_vcpus()
+            .map_err(BuildMicrovmFromSnapshotError::NotifyCpuContainer)?;
+    }
 
     let vmm = Vmm {
         instance_info: instance_info.clone(),
@@ -605,6 +640,7 @@ pub fn build_microvm_from_snapshot(
             .get("vcpu")
             .ok_or(BuildMicrovmFromSnapshotError::MissingVcpuSeccompFilters)?
             .clone(),
+        vcpu_affinities,
     )?;
 
     let vmm = Arc::new(Mutex::new(vmm));

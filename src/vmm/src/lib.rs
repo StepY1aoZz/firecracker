@@ -169,7 +169,9 @@ pub use crate::vstate::kvm::Kvm;
 use crate::vstate::memory::{GuestMemoryMmap, GuestMemoryRegion};
 #[cfg(target_arch = "aarch64")]
 use crate::vstate::vcpu::VcpuState;
-pub use crate::vstate::vcpu::{Vcpu, VcpuConfig, VcpuEvent, VcpuHandle, VcpuResponse};
+pub use crate::vstate::vcpu::{
+    Vcpu, VcpuAffinity, VcpuConfig, VcpuEvent, VcpuHandle, VcpuResponse,
+};
 pub use crate::vstate::vm::{StartVcpusError, Vm};
 
 /// Shorthand type for the EventManager flavour used by Firecracker.
@@ -281,6 +283,50 @@ pub enum VmmError {
     NotSupported,
     /// Failed to create memory hotplug device: {0}
     VirtioMem(#[from] VirtioMemError),
+}
+
+/// Errors associated with runtime vCPU hot-add.
+#[cfg(target_arch = "x86_64")]
+#[derive(Debug, thiserror::Error, displaydoc::Display)]
+pub enum HotplugVcpuError {
+    /// vCPU hot-add requires a running or paused VM.
+    InvalidVmState,
+    /// vCPU hot-add is not supported with GDB enabled.
+    GdbEnabled,
+    /// Invalid vCPU count: {0}
+    InvalidCount(#[from] crate::vmm_config::machine_config::MachineConfigError),
+    /// Invalid vCPU affinity: {0}
+    InvalidAffinity(#[from] crate::vmm_config::vcpu_hotplug::VcpuAffinityError),
+    /// The VM's vCPU bookkeeping is inconsistent: {0}
+    InconsistentState(&'static str),
+    /// The effective vCPU configuration is unavailable.
+    MissingVcpuConfig,
+    /// The vCPU seccomp filter is unavailable.
+    MissingSeccompFilter,
+    /// The ACPI CPU hotplug controller is unavailable.
+    MissingCpuContainer,
+    /// The reference TSC frequency is unavailable.
+    MissingReferenceTsc,
+    /// Failed to pause existing vCPUs: {0}
+    Pause(VmmError),
+    /// Failed to read the current reference TSC offset: {0}
+    GetTscOffset(vmm_sys_util::errno::Error),
+    /// Failed to check whether TSC scaling is required: {0}
+    CheckTscFrequency(crate::arch::GetTscError),
+    /// Failed to create new vCPUs: {0}
+    Create(#[from] vstate::vm::VmError),
+    /// Failed to configure new vCPUs: {0}
+    Configure(#[from] vstate::vcpu::KvmVcpuConfigureError),
+    /// Failed to configure the new vCPU TSC frequency: {0}
+    SetTscFrequency(crate::arch::SetTscError),
+    /// Failed to configure the new vCPU TSC offset: {0}
+    SetTscOffset(vmm_sys_util::errno::Error),
+    /// Failed to start new vCPU threads: {0}
+    Start(#[from] StartVcpusError),
+    /// Failed to resume vCPU threads: {0}
+    Resume(VmmError),
+    /// Failed to notify the guest: {0}
+    Notify(crate::devices::acpi::cpu_container::CpuContainerError),
 }
 
 /// Shorthand type for KVM dirty page bitmap.
@@ -504,6 +550,122 @@ impl Vmm {
         Ok(())
     }
 
+    /// Adds vCPUs to a running or paused x86_64 KVM microVM.
+    #[cfg(target_arch = "x86_64")]
+    pub fn hotplug_vcpus(
+        &mut self,
+        request: crate::vmm_config::vcpu_hotplug::HotplugVcpuConfig,
+    ) -> Result<(), HotplugVcpuError> {
+        if self.instance_info.state == VmState::NotStarted {
+            return Err(HotplugVcpuError::InvalidVmState);
+        }
+        #[cfg(feature = "gdb")]
+        if self.machine_config.gdb_socket_path.is_some() {
+            return Err(HotplugVcpuError::GdbEnabled);
+        }
+
+        let current_count = self.machine_config.vcpu_count;
+        let target_count = request.target_count(current_count, self.machine_config.smt)?;
+        let affinities = request.affinity_map(current_count, target_count)?;
+        let kvm_vm = self
+            .vm
+            .as_kvm()
+            .ok_or(HotplugVcpuError::InconsistentState("KVM is required"))?
+            .clone();
+        let mut vcpu_config = kvm_vm
+            .vcpu_config()
+            .ok_or(HotplugVcpuError::MissingVcpuConfig)?;
+        let seccomp_filter = kvm_vm
+            .vcpu_seccomp_filter()
+            .ok_or(HotplugVcpuError::MissingSeccompFilter)?;
+        if self.device_manager.acpi_devices.cpu_container().is_none() {
+            return Err(HotplugVcpuError::MissingCpuContainer);
+        }
+
+        let handle_count = kvm_vm.vcpus_handles().len();
+        if handle_count != usize::from(current_count)
+            || usize::from(vcpu_config.vcpu_count) != handle_count
+        {
+            return Err(HotplugVcpuError::InconsistentState(
+                "machine config, effective config, and vCPU handles differ",
+            ));
+        }
+        if vcpu_config.normalized_cpuids.len()
+            != usize::from(
+                u8::try_from(vstate::vm::MAX_SUPPORTED_KVM_VCPUS).expect("vCPU limit fits in u8"),
+            )
+        {
+            return Err(HotplugVcpuError::InconsistentState(
+                "normalized CPUID count differs from the possible vCPU count",
+            ));
+        }
+
+        let reference_tsc = kvm_vm
+            .reference_tsc_khz()
+            .ok_or(HotplugVcpuError::MissingReferenceTsc)?;
+
+        let first_new = u8::try_from(current_count).expect("validated vCPU count fits in u8");
+        let end_new = u8::try_from(target_count).expect("validated vCPU count fits in u8");
+        let was_running = self.instance_info.state == VmState::Running;
+        let result = (|| {
+            if was_running {
+                kvm_vm.pause_vcpus().map_err(HotplugVcpuError::Pause)?;
+            }
+            let reference_tsc_offset = {
+                let handles = kvm_vm.vcpus_handles();
+                let reference = handles.first().ok_or(HotplugVcpuError::InconsistentState(
+                    "the VM has no reference vCPU",
+                ))?;
+                if crate::arch::x86_64::vcpu::supports_tsc_offset_attr(&reference.vcpu_fd) {
+                    Some(
+                        crate::arch::x86_64::vcpu::get_tsc_offset(&reference.vcpu_fd)
+                            .map_err(HotplugVcpuError::GetTscOffset)?,
+                    )
+                } else {
+                    None
+                }
+            };
+
+            let mut vcpus = kvm_vm.create_vcpu_range(first_new..end_new)?;
+            for vcpu in &mut vcpus {
+                vcpu.kvm_vcpu.hotplug_configure(&vcpu_config)?;
+                if vcpu
+                    .kvm_vcpu
+                    .is_tsc_scaling_required(reference_tsc)
+                    .map_err(HotplugVcpuError::CheckTscFrequency)?
+                {
+                    vcpu.kvm_vcpu
+                        .set_tsc_khz(reference_tsc)
+                        .map_err(HotplugVcpuError::SetTscFrequency)?;
+                }
+                if let Some(offset) = reference_tsc_offset {
+                    vcpu.kvm_vcpu
+                        .set_tsc_offset(offset)
+                        .map_err(HotplugVcpuError::SetTscOffset)?;
+                }
+            }
+
+            kvm_vm.start_vcpus(vcpus, seccomp_filter, &affinities)?;
+            if was_running {
+                kvm_vm.resume_vcpus().map_err(HotplugVcpuError::Resume)?;
+            }
+
+            vcpu_config.vcpu_count = end_new;
+            kvm_vm.set_vcpu_config(vcpu_config);
+            self.machine_config.vcpu_count = target_count;
+            self.device_manager
+                .acpi_devices
+                .hot_add_vcpus(first_new..end_new)
+                .map_err(HotplugVcpuError::Notify)?;
+            Ok(())
+        })();
+
+        if result.is_err() {
+            self.stop(FcExitCode::GenericError);
+        }
+        result
+    }
+
     /// Injects the external graceful-shutdown event into the guest.
     pub fn send_ctrl_alt_del(&mut self) -> Result<(), VmmError> {
         #[cfg(target_arch = "x86_64")]
@@ -564,6 +726,10 @@ impl Vmm {
             .as_kvm()
             .ok_or_else(|| MicrovmStateError::NotAllowed("save_state requires KVM".into()))?;
         let vcpu_states = kvm_vm.save_vcpu_states()?;
+        #[cfg(target_arch = "x86_64")]
+        let vcpu_config = kvm_vm.vcpu_config().ok_or_else(|| {
+            MicrovmStateError::NotAllowed("effective vCPU configuration is unavailable".into())
+        })?;
         let kvm_state = kvm_vm.kvm().save_state();
         let vm_state = {
             #[cfg(target_arch = "x86_64")]
@@ -587,6 +753,8 @@ impl Vmm {
             kvm_state,
             vm_state,
             vcpu_states,
+            #[cfg(target_arch = "x86_64")]
+            vcpu_config,
             device_states,
         })
     }
@@ -953,5 +1121,51 @@ impl MutEventSubscriber for Vmm {
         {
             error!("Failed to register hot-unplug completion event: {}", err);
         }
+    }
+}
+
+#[cfg(test)]
+#[cfg(target_arch = "x86_64")]
+mod tests {
+    use super::*;
+    use crate::test_utils::default_vmm_no_boot;
+    use crate::test_utils::mock_resources::NOISY_KERNEL_IMAGE;
+    use crate::vmm_config::vcpu_hotplug::HotplugVcpuConfig;
+
+    #[test]
+    fn test_hotplug_uses_current_tsc_offset() {
+        const CURRENT_OFFSET: i64 = -5_000_000_000;
+
+        let (vmm, _) = default_vmm_no_boot(Some(NOISY_KERNEL_IMAGE));
+        let mut vmm = vmm.lock().unwrap();
+        let kvm_vm = vmm.vm.as_kvm().unwrap().clone();
+        let tsc_offset_supported = {
+            let handles = kvm_vm.vcpus_handles();
+            let reference = &handles[0].vcpu_fd;
+            let supported = crate::arch::x86_64::vcpu::supports_tsc_offset_attr(reference);
+            if supported {
+                crate::arch::x86_64::vcpu::set_tsc_offset(reference, CURRENT_OFFSET).unwrap();
+            }
+            supported
+        };
+        if !tsc_offset_supported {
+            vmm.stop(FcExitCode::Ok);
+            return;
+        }
+
+        vmm.hotplug_vcpus(HotplugVcpuConfig {
+            add: 1,
+            affinity: vec![],
+        })
+        .unwrap();
+
+        {
+            let handles = kvm_vm.vcpus_handles();
+            assert_eq!(
+                crate::arch::x86_64::vcpu::get_tsc_offset(&handles[1].vcpu_fd).unwrap(),
+                CURRENT_OFFSET
+            );
+        }
+        vmm.stop(FcExitCode::Ok);
     }
 }

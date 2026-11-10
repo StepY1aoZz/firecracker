@@ -306,7 +306,7 @@ pub enum CpuidTryFromKvmCpuid {
 }
 
 /// CPUID information
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Cpuid {
     /// Intel CPUID specific information.
     Intel(IntelCpuid),
@@ -437,7 +437,7 @@ impl TryFrom<Cpuid> for kvm_bindings::CpuId {
 }
 
 /// CPUID index values `leaf` and `subleaf`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CpuidKey {
     /// CPUID leaf.
     pub leaf: u32,

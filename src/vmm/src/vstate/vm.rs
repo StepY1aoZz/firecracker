@@ -8,9 +8,10 @@
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::ops::Range;
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Barrier, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 #[cfg(target_arch = "x86_64")]
 use kvm_bindings::KVM_IRQCHIP_IOAPIC;
@@ -42,7 +43,7 @@ use crate::vstate::memory::{
     GuestRegionMmapExt, MemoryError,
 };
 use crate::vstate::resources::ResourceAllocator;
-use crate::vstate::vcpu::{StartThreadedError, VcpuError, VcpuHandle};
+use crate::vstate::vcpu::{StartThreadedError, VcpuConfig, VcpuError, VcpuHandle};
 use crate::{DirtyBitmap, Vcpu, mem_size_mib};
 
 /// Maximum number of vCPUs supported by a KVM microVM.
@@ -63,6 +64,9 @@ const _: () = assert!(MAX_SUPPORTED_KVM_VCPUS <= u8::MAX as u16);
 pub enum StartVcpusError {
     /// Failed to set terminal mode: {0}
     SetTerminalMode(#[from] vmm_sys_util::errno::Error),
+    /// Failed to read the reference TSC frequency: {0}
+    #[cfg(target_arch = "x86_64")]
+    GetTscFrequency(#[from] crate::arch::GetTscError),
     /// Vcpu handle error: {0}
     VcpuHandle(#[from] StartThreadedError),
 }
@@ -95,6 +99,13 @@ pub struct VmCommon {
     pub uffd: Option<Uffd>,
     /// Handles to vCPU threads.
     pub vcpus_handles: Mutex<Vec<VcpuHandle>>,
+    /// Effective guest CPU configuration reused by vCPUs added after boot or restore.
+    vcpu_config: Mutex<Option<VcpuConfig>>,
+    /// Filter inherited by vCPU threads created after the VMM enters its event loop.
+    vcpu_seccomp_filter: OnceLock<Arc<crate::seccomp::BpfProgram>>,
+    /// TSC frequency captured before vCPU 0 starts running.
+    #[cfg(target_arch = "x86_64")]
+    reference_tsc_khz: OnceLock<u32>,
     /// Event fd written to by vCPUs on exit.
     pub vcpus_exit_evt: EventFd,
     /// Test-only countdown that forces the Nth-next `set_user_memory_region` call to fail, used
@@ -221,20 +232,30 @@ impl KvmVm {
             kvm,
             uffd: None,
             vcpus_handles: Mutex::new(Vec::new()),
+            vcpu_config: Mutex::new(None),
+            vcpu_seccomp_filter: OnceLock::new(),
+            #[cfg(target_arch = "x86_64")]
+            reference_tsc_khz: OnceLock::new(),
             vcpus_exit_evt,
             #[cfg(test)]
             fail_set_user_memory_region_in: AtomicU32::new(0),
         })
     }
 
-    /// Creates the specified number of [`Vcpu`]s.
+    /// Creates the specified number of [`Vcpu`]s for initial boot or snapshot restore.
     ///
     /// Each vCPU gets a clone of the `vcpus_exit_evt` EventFd stored on this KvmVm.
     pub fn create_vcpus(&mut self, vcpu_count: u8) -> Result<Vec<Vcpu>, VmError> {
         self.arch_pre_create_vcpus(vcpu_count)?;
+        let vcpus = self.create_vcpu_range(0..vcpu_count)?;
+        self.arch_post_create_vcpus(vcpu_count)?;
+        Ok(vcpus)
+    }
 
-        let mut vcpus = Vec::with_capacity(vcpu_count as usize);
-        for cpu_idx in 0..vcpu_count {
+    /// Creates a contiguous vCPU ID range without repeating architecture boot hooks.
+    pub fn create_vcpu_range(&self, ids: Range<u8>) -> Result<Vec<Vcpu>, VmError> {
+        let mut vcpus = Vec::with_capacity(ids.len());
+        for cpu_idx in ids {
             let exit_evt = self
                 .vcpus_exit_evt()
                 .try_clone()
@@ -242,9 +263,6 @@ impl KvmVm {
             let vcpu = Vcpu::new(cpu_idx, self, exit_evt).map_err(VmError::CreateVcpu)?;
             vcpus.push(vcpu);
         }
-
-        self.arch_post_create_vcpus(vcpu_count)?;
-
         Ok(vcpus)
     }
 
@@ -263,48 +281,92 @@ impl KvmVm {
         self.common.vcpus_handles.lock().expect("Poisoned lock")
     }
 
+    /// Stores the effective guest CPU configuration for later vCPU creation.
+    pub fn set_vcpu_config(&self, config: VcpuConfig) {
+        *self.common.vcpu_config.lock().expect("Poisoned lock") = Some(config);
+    }
+
+    /// Returns the effective guest CPU configuration, if it has been initialized.
+    pub fn vcpu_config(&self) -> Option<VcpuConfig> {
+        self.common
+            .vcpu_config
+            .lock()
+            .expect("Poisoned lock")
+            .clone()
+    }
+
+    /// Returns the filter used to initialize new vCPU threads.
+    pub fn vcpu_seccomp_filter(&self) -> Option<Arc<crate::seccomp::BpfProgram>> {
+        self.common.vcpu_seccomp_filter.get().cloned()
+    }
+
+    /// Returns the TSC frequency captured before vCPU 0 started running.
+    #[cfg(target_arch = "x86_64")]
+    pub fn reference_tsc_khz(&self) -> Option<u32> {
+        self.common.reference_tsc_khz.get().copied()
+    }
+
     /// Sets the userfaultfd (used during snapshot restore).
     pub fn set_uffd(&mut self, uffd: Option<Uffd>) {
         self.common.uffd = uffd;
     }
 
-    /// Starts the microVM vCPUs.
-    ///
-    /// Sets the terminal to raw/non-blocking mode, then spawns a thread per vCPU
-    /// and stores the resulting handles. The barrier is used to synchronize TLS
-    /// initialization across all vCPU threads before returning.
+    /// Starts the microVM vCPUs in the paused state and publishes their handles only after every
+    /// thread has applied its optional affinity and seccomp filter successfully.
     pub fn start_vcpus(
         self: &Arc<Self>,
         mut vcpus: Vec<Vcpu>,
         vcpu_seccomp_filter: Arc<crate::seccomp::BpfProgram>,
+        affinities: &HashMap<u8, Vec<u32>>,
     ) -> Result<(), StartVcpusError> {
-        let vcpu_count = vcpus.len();
-        let barrier = Arc::new(Barrier::new(vcpu_count + 1));
+        if self.vcpus_handles().is_empty() {
+            let stdin = std::io::stdin().lock();
+            stdin.set_raw_mode().inspect_err(|&err| {
+                crate::logger::warn!("Cannot set raw mode for the terminal. {:?}", err);
+            })?;
+            stdin.set_non_block(true).inspect_err(|&err| {
+                crate::logger::warn!("Cannot set non block for the terminal. {:?}", err);
+            })?;
+        }
 
-        let stdin = std::io::stdin().lock();
-        stdin.set_raw_mode().inspect_err(|&err| {
-            crate::logger::warn!("Cannot set raw mode for the terminal. {:?}", err);
-        })?;
-        stdin.set_non_block(true).inspect_err(|&err| {
-            crate::logger::warn!("Cannot set non block for the terminal. {:?}", err);
-        })?;
+        let _ = self
+            .common
+            .vcpu_seccomp_filter
+            .set(vcpu_seccomp_filter.clone());
 
-        let mut handles = self.vcpus_handles();
-        handles.reserve(vcpu_count);
+        #[cfg(target_arch = "x86_64")]
+        if self.common.reference_tsc_khz.get().is_none()
+            && let Some(reference) = vcpus.first()
+        {
+            let _ = self
+                .common
+                .reference_tsc_khz
+                .set(reference.kvm_vcpu.get_tsc_khz()?);
+        }
+
+        let mut staged = Vec::with_capacity(vcpus.len());
         for mut vcpu in vcpus.drain(..) {
             vcpu.set_mmio_bus(self.common.mmio_bus.clone());
             #[cfg(target_arch = "x86_64")]
             vcpu.kvm_vcpu.set_pio_bus(self.pio_bus.clone());
 
-            handles.push(vcpu.start_threaded(
-                self,
-                vcpu_seccomp_filter.clone(),
-                barrier.clone(),
-            )?);
+            let affinity = affinities.get(&vcpu.kvm_vcpu.index).cloned();
+            match vcpu.start_threaded(self, vcpu_seccomp_filter.clone(), affinity) {
+                Ok(handle) => staged.push(handle),
+                Err(err) => {
+                    staged.iter().for_each(VcpuHandle::finish_staged);
+                    return Err(err.into());
+                }
+            }
         }
-        drop(handles);
-        barrier.wait();
+        for handle in &staged {
+            if let Err(err) = handle.wait_for_startup() {
+                staged.iter().for_each(VcpuHandle::finish_staged);
+                return Err(err.into());
+            }
+        }
 
+        self.vcpus_handles().append(&mut staged);
         Ok(())
     }
 
@@ -332,7 +394,10 @@ impl KvmVm {
 
     /// Sends a resume event to all vCPUs and waits for acknowledgement.
     pub fn resume_vcpus(&self) -> Result<(), crate::VmmError> {
-        let mut handles = self.vcpus_handles();
+        Self::resume_vcpu_handles(&mut self.vcpus_handles())
+    }
+
+    fn resume_vcpu_handles(handles: &mut [VcpuHandle]) -> Result<(), crate::VmmError> {
         handles
             .iter_mut()
             .try_for_each(|handle| handle.send_event(crate::VcpuEvent::Resume))

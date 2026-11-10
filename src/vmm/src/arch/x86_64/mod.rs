@@ -46,8 +46,8 @@ use crate::utils::{u64_to_usize, usize_to_u64};
 use crate::vstate::memory::{
     Address, GuestAddress, GuestMemoryMmap, GuestMemoryRegion, GuestRegionType, MemoryError,
 };
-use crate::vstate::vcpu::KvmVcpuConfigureError;
-use crate::vstate::vm::KvmVm;
+use crate::vstate::vcpu::{KvmVcpuConfigureError, VcpuConfig};
+use crate::vstate::vm::{KvmVm, MAX_SUPPORTED_KVM_VCPUS};
 use crate::{Vcpu, align_down};
 use kvm::Kvm;
 use layout::{
@@ -196,15 +196,22 @@ fn configure_vcpus_for_boot(
     cpu_template: &CustomCpuTemplate,
     guest_mem: &GuestMemoryMmap,
     entry_point: EntryPoint,
-) -> Result<(), ConfigurationError> {
+) -> Result<VcpuConfig, ConfigurationError> {
     // Phase 1: construct the shared, templated guest CPUID.
     let cpuid = Cpuid::try_from(kvm.supported_cpuid.clone()).map_err(GuestConfigError::from)?;
     let cpuid = apply_template_to_cpuid(cpuid, cpu_template)?;
 
+    // Topology must remain stable when vCPUs are added after boot.
+    let possible_vcpus = u8::try_from(MAX_SUPPORTED_KVM_VCPUS).expect("vCPU limit fits in u8");
+
     // Phase 2: set each normalized CPUID before reading CPUID-dependent MSRs.
+    let normalized_cpuids = (0..possible_vcpus)
+        .map(|index| vcpu::KvmVcpu::normalize_cpuid(index, &cpuid, possible_vcpus, smt))
+        .collect::<Result<Vec<_>, _>>()?;
     let configured_cpuids = vcpus
         .iter()
-        .map(|vcpu| vcpu.kvm_vcpu.configure_cpuid(&cpuid, vcpu_count, smt))
+        .zip(&normalized_cpuids)
+        .map(|(vcpu, normalized_cpuid)| vcpu.kvm_vcpu.install_cpuid(normalized_cpuid))
         .collect::<Result<Vec<_>, _>>()?;
 
     // Phase 3: construct the shared, templated MSRs from vCPU 0's post-CPUID state.
@@ -221,6 +228,22 @@ fn configure_vcpus_for_boot(
         vcpu.kvm_vcpu.configure_boot_state(guest_mem, entry_point)?;
     }
 
+    Ok(VcpuConfig {
+        vcpu_count,
+        smt,
+        cpu_config: crate::cpu_config::x86_64::CpuConfiguration { cpuid, msrs },
+        normalized_cpuids,
+    })
+}
+
+/// Configures vCPUs added after boot from the effective boot-time configuration.
+pub fn configure_vcpus_for_hotplug(
+    vcpus: &mut [Vcpu],
+    config: &VcpuConfig,
+) -> Result<(), ConfigurationError> {
+    for vcpu in vcpus {
+        vcpu.kvm_vcpu.hotplug_configure(config)?;
+    }
     Ok(())
 }
 
@@ -237,8 +260,8 @@ pub fn configure_system_for_boot(
     entry_point: EntryPoint,
     initrd: &Option<InitrdConfig>,
     boot_cmdline: Cmdline,
-) -> Result<(), ConfigurationError> {
-    configure_vcpus_for_boot(
+) -> Result<VcpuConfig, ConfigurationError> {
+    let vcpu_config = configure_vcpus_for_boot(
         kvm,
         vcpus,
         vcpu_count,
@@ -289,7 +312,7 @@ pub fn configure_system_for_boot(
         &mut vm.resource_allocator(),
         vcpus,
     )?;
-    Ok(())
+    Ok(vcpu_config)
 }
 
 fn configure_pvh(

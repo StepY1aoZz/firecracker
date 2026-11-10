@@ -101,6 +101,9 @@ pub struct MicrovmState {
     pub vm_state: VmState,
     /// Vcpu states.
     pub vcpu_states: Vec<VcpuState>,
+    /// Effective CPU configuration reused when adding vCPUs after restore.
+    #[cfg(target_arch = "x86_64")]
+    pub vcpu_config: vstate::vcpu::VcpuConfig,
     /// Device states.
     pub device_states: DevicesState,
 }
@@ -167,7 +170,7 @@ pub enum CreateSnapshotError {
 }
 
 /// Snapshot version
-pub const SNAPSHOT_VERSION: Version = Version::new(13, 0, 0);
+pub const SNAPSHOT_VERSION: Version = Version::new(14, 0, 0);
 
 /// Creates a Microvm snapshot.
 pub fn create_snapshot(
@@ -309,6 +312,8 @@ pub enum SnapShotStateSanityCheckError {
     DramMemoryTooManySlots,
     /// DRAM memory is unplugged.
     DramMemoryUnplugged,
+    /// Effective vCPU configuration does not match the serialized vCPU states.
+    VcpuConfigMismatch,
 }
 
 /// Performs sanity checks against the state file and returns specific errors.
@@ -346,6 +351,15 @@ pub fn snapshot_state_sanity_check(
     }
 
     #[cfg(target_arch = "x86_64")]
+    if usize::from(microvm_state.vcpu_config.vcpu_count) != microvm_state.vcpu_states.len()
+        || microvm_state.vcpu_config.smt != microvm_state.vm_info.smt
+        || microvm_state.vcpu_config.normalized_cpuids.len()
+            != usize::from(vstate::vm::MAX_SUPPORTED_KVM_VCPUS)
+    {
+        return Err(SnapShotStateSanityCheckError::VcpuConfigMismatch);
+    }
+
+    #[cfg(target_arch = "x86_64")]
     validate_cpu_vendor(microvm_state);
     #[cfg(target_arch = "aarch64")]
     validate_cpu_manufacturer_id(microvm_state);
@@ -364,6 +378,12 @@ pub enum RestoreFromSnapshotError {
     GuestMemory(#[from] RestoreFromSnapshotGuestMemoryError),
     /// Failed to build microVM from snapshot: {0}
     Build(#[from] BuildMicrovmFromSnapshotError),
+    /// Invalid vCPU hot-add count: {0}
+    VcpuHotplugCount(MachineConfigError),
+    /// Invalid vCPU hot-add affinity: {0}
+    VcpuHotplugAffinity(crate::vmm_config::vcpu_hotplug::VcpuAffinityError),
+    /// vCPU hot-add during snapshot restore is only supported on x86_64.
+    VcpuHotplugUnsupported,
 }
 /// Sub-Error type for [`restore_from_snapshot`] to contain either [`GuestMemoryFromFileError`] or
 /// [`GuestMemoryFromUffdError`] within [`RestoreFromSnapshotError`].
@@ -429,12 +449,35 @@ pub fn restore_from_snapshot(
 
     let track_dirty_pages = params.track_dirty_pages;
 
-    let vcpu_count = microvm_state
-        .vcpu_states
-        .len()
-        .try_into()
+    snapshot_state_sanity_check(&microvm_state)?;
+    let serialized_vcpu_count = u16::try_from(microvm_state.vcpu_states.len())
         .map_err(|_| MachineConfigError::InvalidVcpuCount)
         .map_err(BuildMicrovmFromSnapshotError::VmUpdateConfig)?;
+
+    #[cfg(target_arch = "x86_64")]
+    let (vcpu_count, vcpu_affinities) = match &params.vcpu_hotplug {
+        Some(config) => {
+            let target = config
+                .target_count(serialized_vcpu_count, microvm_state.vm_info.smt)
+                .map_err(RestoreFromSnapshotError::VcpuHotplugCount)?;
+            let affinities = config
+                .affinity_map(serialized_vcpu_count, target)
+                .map_err(RestoreFromSnapshotError::VcpuHotplugAffinity)?;
+            microvm_state.vcpu_config.vcpu_count = u8::try_from(target)
+                .map_err(|_| MachineConfigError::InvalidVcpuCount)
+                .map_err(RestoreFromSnapshotError::VcpuHotplugCount)?;
+            (target, affinities)
+        }
+        None => (serialized_vcpu_count, std::collections::HashMap::new()),
+    };
+
+    #[cfg(target_arch = "aarch64")]
+    let (vcpu_count, vcpu_affinities) = {
+        if params.vcpu_hotplug.is_some() {
+            return Err(RestoreFromSnapshotError::VcpuHotplugUnsupported);
+        }
+        (serialized_vcpu_count, std::collections::HashMap::new())
+    };
 
     // Due to questionable past API design decisions whether the restored VM
     // uses PCI is decided by the snapshot and not by the --enable-pci flag of
@@ -465,9 +508,6 @@ pub fn restore_from_snapshot(
             gdb_socket_path: None,
         })
         .map_err(BuildMicrovmFromSnapshotError::VmUpdateConfig)?;
-
-    // Some sanity checks before building the microvm.
-    snapshot_state_sanity_check(&microvm_state)?;
 
     let mem_backend_path = &params.mem_backend.backend_path;
     let mem_state = &microvm_state.vm_state.memory;
@@ -508,6 +548,7 @@ pub fn restore_from_snapshot(
         seccomp_filters,
         vm_resources,
         params.clock_realtime,
+        &vcpu_affinities,
     )
     .map_err(RestoreFromSnapshotError::Build)
 }
@@ -790,6 +831,8 @@ mod tests {
         let microvm_state = MicrovmState {
             device_states: states,
             vcpu_states,
+            #[cfg(target_arch = "x86_64")]
+            vcpu_config: Default::default(),
             kvm_state: Default::default(),
             vm_info: VmInfo {
                 mem_size_mib: 1u64,
