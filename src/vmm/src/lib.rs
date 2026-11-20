@@ -148,7 +148,7 @@ use crate::devices::virtio::net::Net;
 use crate::devices::virtio::pmem::device::Pmem;
 use crate::devices::virtio::rng::Entropy;
 use crate::devices::virtio::vsock::{Vsock, VsockUnixBackend};
-use crate::logger::{METRICS, MetricsError, log_dev_preview_warning};
+use crate::logger::{IncMetric, METRICS, MetricsError, StoreMetric, log_dev_preview_warning};
 use crate::mmds::data_store::Mmds;
 use crate::nitro_enclave::enclave_vm::EnclaveVm;
 use crate::persist::{MicrovmState, MicrovmStateError, VmInfo};
@@ -167,6 +167,7 @@ use crate::vmm_config::memory_hotplug::MemoryHotplugConfig;
 use crate::vmm_config::mmds::MmdsConfig;
 use crate::vmm_config::net::NetworkInterfaceConfig;
 use crate::vmm_config::snapshot::SnapshotType;
+use crate::vmm_config::pvpanic::PvPanicAction;
 use crate::vmm_config::vsock::VsockDeviceConfig;
 pub use crate::vstate::kvm::Kvm;
 use crate::vstate::memory::{GuestMemoryMmap, GuestMemoryRegion};
@@ -532,9 +533,8 @@ impl Vmm {
 
     /// Sends a pause command to the vCPUs.
     ///
-    /// This only parks the vCPU threads. Device emulation is stopped by
-    /// `ApiServerAdapter::handle_request`, which after a successful pause stops polling
-    /// the event loop and only serves API requests until `Resume`.
+    /// This only parks the vCPU threads. The main event loop stops polling
+    /// device events while paused and keeps serving API requests in API mode.
     pub fn pause_vm(&mut self) -> Result<(), VmmError> {
         let kvm_vm = self
             .vm
@@ -946,6 +946,37 @@ impl MutEventSubscriber for Vmm {
             return;
         }
 
+        if let Some(evt) = self.device_manager.pvpanic_evt()
+            && source == evt.as_raw_fd()
+            && event_set == EventSet::IN
+        {
+            let _ = evt.read();
+            warn!("Guest kernel panicked");
+            METRICS.vmm.guest_panic_count.store(1);
+
+            let panic_action = self
+                .device_manager
+                .mmio_platform_devices
+                .pvpanic
+                .as_ref()
+                .unwrap()
+                .inner
+                .lock()
+                .expect("Poisoned pvpanic lock")
+                .panic_action();
+            if panic_action == PvPanicAction::Pause
+                && let Err(err) = self.pause_vm()
+            {
+                error!("Failed to pause microVM after guest panic: {err}");
+                self.stop(FcExitCode::GenericError);
+            }
+            if let Err(err) = METRICS.write() {
+                METRICS.logger.missed_metrics_count.inc();
+                error!("Failed to write metrics after guest panic: {err}");
+            }
+            return;
+        }
+
         match &self.vm {
             Vm::Kvm(kvm_vm) => {
                 if source == kvm_vm.vcpus_exit_evt().as_raw_fd() && event_set == EventSet::IN {
@@ -1023,6 +1054,87 @@ impl MutEventSubscriber for Vmm {
             && let Err(err) = ops.add(Events::new(evt, EventSet::IN))
         {
             error!("Failed to register hot-unplug completion event: {}", err);
+        }
+        if let Some(evt) = self.device_manager.pvpanic_evt()
+            && let Err(err) = ops.add(Events::new(evt, EventSet::IN))
+        {
+            error!("Failed to register pvpanic event: {err}");
+            self.stop(FcExitCode::GenericError);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use event_manager::SubscriberOps;
+
+    use super::*;
+    use crate::devices::pseudo::pvpanic::PVPANIC_PANICKED;
+    use crate::seccomp::get_empty_filters;
+    #[cfg(target_arch = "x86_64")]
+    use crate::test_utils::mock_resources::NOISY_KERNEL_IMAGE;
+    use crate::test_utils::mock_resources::{MockBootSourceConfig, MockVmResources};
+
+    #[test]
+    fn test_guest_panic_reports_and_applies_action() {
+        for action in [PvPanicAction::None, PvPanicAction::Pause] {
+            let boot_source = MockBootSourceConfig::new().with_default_boot_args();
+            #[cfg(target_arch = "x86_64")]
+            let boot_source = boot_source.with_kernel(NOISY_KERNEL_IMAGE);
+            let resources = MockVmResources::new()
+                .with_boot_source(boot_source.into())
+                .with_vm_config(MachineConfig {
+                    vcpu_count: 2,
+                    ..Default::default()
+                })
+                .into();
+            let mut event_manager = EventManager::new().unwrap();
+            let vmm = builder::build_microvm_for_boot(
+                &InstanceInfo::default(),
+                &resources,
+                &mut event_manager,
+                &get_empty_filters(),
+            )
+            .unwrap();
+            let (addr, bus) = {
+                let mut vmm = vmm.lock().unwrap();
+                let vm = vmm.vm.as_kvm().unwrap().clone();
+                vmm.device_manager
+                    .attach_pvpanic_device(&vm, action)
+                    .unwrap();
+                let addr = vmm
+                    .device_manager
+                    .mmio_platform_devices
+                    .pvpanic
+                    .as_ref()
+                    .unwrap()
+                    .resources
+                    .addr;
+                (addr, vm.common.mmio_bus.clone())
+            };
+            let mut event_manager = EventManager::new().unwrap();
+            event_manager.add_subscriber(vmm.clone());
+            vmm.lock().unwrap().resume_vm().unwrap();
+
+            let _ = bus.write(addr, &[PVPANIC_PANICKED]).unwrap();
+            event_manager.run_with_timeout(500).unwrap();
+            assert_eq!(METRICS.vmm.guest_panic_count.fetch(), 1);
+
+            let mut vmm = vmm.lock().unwrap();
+            assert_eq!(
+                vmm.instance_info.state,
+                match action {
+                    PvPanicAction::None => VmState::Running,
+                    PvPanicAction::Pause => VmState::Paused,
+                }
+            );
+            assert_eq!(vmm.shutdown_exit_code(), None);
+            vmm.pause_vm().unwrap();
+            let vm_info = VmInfo::from(&*vmm);
+            let state = vmm.save_state(&vm_info).unwrap();
+            assert_eq!(state.vcpu_states.len(), 2);
+            vmm.resume_vm().unwrap();
+            assert_eq!(METRICS.vmm.guest_panic_count.fetch(), 1);
         }
     }
 }
