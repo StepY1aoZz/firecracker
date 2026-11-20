@@ -33,6 +33,8 @@ pub mod mmds;
 pub mod net;
 /// Wrapper for configuring the pmem devises attached to the microVM.
 pub mod pmem;
+/// Wrapper for configuring the pvpanic device.
+pub mod pvpanic;
 /// Wrapper for configuring microVM snapshots and the microVM state.
 pub mod serial;
 pub mod snapshot;
