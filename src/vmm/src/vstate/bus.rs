@@ -15,6 +15,18 @@ use slab::Slab;
 
 use crate::utils::usize_to_u64;
 
+/// Action for the vCPU to perform after a device write.
+#[derive(Debug, Default)]
+pub enum BusWriteAction {
+    /// Continue guest execution.
+    #[default]
+    Continue,
+    /// Wait for device synchronization after releasing the bus and device locks.
+    WaitFor(Arc<Barrier>),
+    /// Complete pending KVM I/O, then pause the current vCPU without an unsolicited response.
+    PauseVcpu,
+}
+
 /// Trait for devices that respond to reads or writes in an arbitrary address space.
 ///
 /// The device does not care where it exists in address space as each method is only given an offset
@@ -24,8 +36,8 @@ pub trait BusDevice: Send {
     /// Reads at `offset` from this device
     fn read(&mut self, base: u64, offset: u64, data: &mut [u8]) {}
     /// Writes at `offset` into this device
-    fn write(&mut self, base: u64, offset: u64, data: &[u8]) -> Option<Arc<Barrier>> {
-        None
+    fn write(&mut self, base: u64, offset: u64, data: &[u8]) -> BusWriteAction {
+        BusWriteAction::Continue
     }
 }
 
@@ -253,7 +265,7 @@ impl Bus {
     }
 
     /// Writes `data` to the device that owns the range containing `addr`.
-    pub fn write(&self, addr: u64, data: &[u8]) -> Result<Option<Arc<Barrier>>, BusError> {
+    pub fn write(&self, addr: u64, data: &[u8]) -> Result<BusWriteAction, BusError> {
         self.with_device(addr, usize_to_u64(data.len()), |dev, base, offset| {
             dev.write(base, offset, data)
         })
@@ -277,13 +289,58 @@ mod tests {
         }
 
         #[allow(clippy::cast_possible_truncation)]
-        fn write(&mut self, _base: u64, offset: u64, data: &[u8]) -> Option<Arc<Barrier>> {
+        fn write(&mut self, _base: u64, offset: u64, data: &[u8]) -> BusWriteAction {
             for (i, v) in data.iter().enumerate() {
                 assert_eq!(*v, (offset as u8) + (i as u8))
             }
 
-            None
+            BusWriteAction::Continue
         }
+    }
+
+    #[test]
+    fn bus_write_actions() {
+        struct ActionDevice(BusWriteAction);
+        impl BusDevice for ActionDevice {
+            fn write(&mut self, _base: u64, _offset: u64, _data: &[u8]) -> BusWriteAction {
+                std::mem::take(&mut self.0)
+            }
+        }
+
+        let bus = Bus::new();
+        let barrier = Arc::new(Barrier::new(2));
+        let device = Arc::new(Mutex::new(ActionDevice(BusWriteAction::WaitFor(
+            barrier.clone(),
+        ))));
+        bus.insert(device.clone(), 0x10, 1).unwrap();
+        let BusWriteAction::WaitFor(returned) = bus.write(0x10, &[0]).unwrap() else {
+            panic!("Bus must forward the device's synchronization action");
+        };
+        assert!(Arc::ptr_eq(&barrier, &returned));
+        // Returning the action must release the device and bus locks.
+        {
+            let _device = device.try_lock().unwrap();
+        }
+        {
+            let _devices = bus.devices.try_write().unwrap();
+        }
+        {
+            let _ranges = bus.ranges.try_write().unwrap();
+        }
+
+        device.lock().unwrap().0 = BusWriteAction::PauseVcpu;
+        assert!(matches!(
+            bus.write(0x10, &[0]).unwrap(),
+            BusWriteAction::PauseVcpu
+        ));
+        assert!(matches!(
+            bus.write(0x10, &[0]).unwrap(),
+            BusWriteAction::Continue
+        ));
+        assert!(matches!(
+            DummyDevice.write(0, 0, &[0]),
+            BusWriteAction::Continue
+        ));
     }
 
     #[test]

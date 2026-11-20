@@ -6,14 +6,14 @@
 // SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 
 use std::fmt::Debug;
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Mutex};
 
 use byteorder::{ByteOrder, LittleEndian};
 
 use crate::pci::configuration::PciConfiguration;
 use crate::pci::{PciBridgeSubclass, PciClassCode, PciDevice};
 use crate::utils::u64_to_usize;
-use crate::vstate::bus::BusDevice;
+use crate::vstate::bus::{BusDevice, BusWriteAction};
 
 /// Errors for the PCI bus.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
@@ -61,14 +61,9 @@ impl PciHostBridge {
 impl BusDevice for PciHostBridge {}
 
 impl PciDevice for PciHostBridge {
-    fn write_config_register(
-        &mut self,
-        reg_idx: u16,
-        offset: u8,
-        data: &[u8],
-    ) -> Option<Arc<Barrier>> {
+    fn write_config_register(&mut self, reg_idx: u16, offset: u8, data: &[u8]) -> BusWriteAction {
         self.config.write_config_register(reg_idx, offset, data);
-        None
+        BusWriteAction::Continue
     }
 
     fn read_config_register(&mut self, reg_idx: u16) -> u32 {
@@ -244,24 +239,26 @@ impl PciConfigIo {
     /// Handle a configuration space write over Port IO
     // offset is validated to be < 4 at the top of this function.
     #[allow(clippy::cast_possible_truncation)]
-    pub fn config_space_write(&mut self, offset: u64, data: &[u8]) -> Option<Arc<Barrier>> {
+    pub fn config_space_write(&mut self, offset: u64, data: &[u8]) -> BusWriteAction {
         if u64_to_usize(offset) + data.len() > 4 {
-            return None;
+            return BusWriteAction::Continue;
         }
 
         let enabled = (self.config_address & 0x8000_0000) != 0;
         if !enabled {
-            return None;
+            return BusWriteAction::Continue;
         }
 
         let (bus, device, function, register) =
             parse_io_config_address(self.config_address & !0x8000_0000);
 
-        let pci_bus = self.buses.get(bus)?;
+        let Some(pci_bus) = self.buses.get(bus) else {
+            return BusWriteAction::Continue;
+        };
 
         // Don't support multi-function devices.
         if function > 0 {
-            return None;
+            return BusWriteAction::Continue;
         }
 
         // NOTE: Potential contention among vCPU threads on this lock. This should not
@@ -278,7 +275,7 @@ impl PciConfigIo {
             // Update the register value
             device.write_config_register(register, offset, data)
         } else {
-            None
+            BusWriteAction::Continue
         }
     }
 
@@ -326,15 +323,15 @@ impl BusDevice for PciConfigIo {
         }
     }
 
-    fn write(&mut self, _base: u64, offset: u64, data: &[u8]) -> Option<Arc<Barrier>> {
+    fn write(&mut self, _base: u64, offset: u64, data: &[u8]) -> BusWriteAction {
         // `offset` is relative to 0xcf8
         match offset {
             o @ 0..=3 => {
                 self.set_config_address(o, data);
-                None
+                BusWriteAction::Continue
             }
             o @ 4..=7 => self.config_space_write(o - 4, data),
-            _ => None,
+            _ => BusWriteAction::Continue,
         }
     }
 }
@@ -371,20 +368,25 @@ impl PciConfigMmio {
         }
     }
 
-    fn config_space_write(&mut self, config_address: u32, offset: u64, data: &[u8]) {
+    fn config_space_write(
+        &mut self,
+        config_address: u32,
+        offset: u64,
+        data: &[u8],
+    ) -> BusWriteAction {
         if u64_to_usize(offset) + data.len() > 4 {
-            return;
+            return BusWriteAction::Continue;
         }
 
         let (bus, device, function, register) = parse_mmio_config_address(config_address);
 
         let Some(pci_bus) = self.buses.get(bus) else {
-            return;
+            return BusWriteAction::Continue;
         };
 
         // Don't support multi-function devices.
         if function > 0 {
-            return;
+            return BusWriteAction::Continue;
         }
 
         let pci_bus = pci_bus.lock().unwrap();
@@ -396,7 +398,9 @@ impl PciConfigMmio {
             let offset = offset as u8;
 
             // Update the register value
-            device.write_config_register(register, offset, data);
+            device.write_config_register(register, offset, data)
+        } else {
+            BusWriteAction::Continue
         }
     }
 }
@@ -423,18 +427,16 @@ impl BusDevice for PciConfigMmio {
         }
     }
 
-    fn write(&mut self, _base: u64, offset: u64, data: &[u8]) -> Option<Arc<Barrier>> {
+    fn write(&mut self, _base: u64, offset: u64, data: &[u8]) -> BusWriteAction {
         if offset > u64::from(u32::MAX) {
-            return None;
+            return BusWriteAction::Continue;
         }
 
         // offset is checked to fit in u32 before narrowing.
         #[allow(clippy::cast_possible_truncation)]
         let offset_u32 = offset as u32;
 
-        self.config_space_write(offset_u32, offset % 4, data);
-
-        None
+        self.config_space_write(offset_u32, offset % 4, data)
     }
 }
 
@@ -495,9 +497,9 @@ mod tests {
     use crate::pci::bus::{DEVICE_ID_INTEL_VIRT_PCIE_HOST, VENDOR_ID_INTEL};
     use crate::pci::configuration::PciConfiguration;
     use crate::pci::{PciClassCode, PciDevice, PciMassStorageSubclass};
-    use crate::vstate::bus::BusDevice;
+    use crate::vstate::bus::{BusDevice, BusWriteAction};
 
-    struct PciDevMock(PciConfiguration);
+    struct PciDevMock(PciConfiguration, BusWriteAction);
 
     impl PciDevMock {
         fn new() -> Self {
@@ -510,7 +512,7 @@ mod tests {
                 0x13,
                 0x12,
             );
-            PciDevMock(config)
+            PciDevMock(config, BusWriteAction::Continue)
         }
     }
 
@@ -520,14 +522,77 @@ mod tests {
             reg_idx: u16,
             offset: u8,
             data: &[u8],
-        ) -> Option<Arc<std::sync::Barrier>> {
+        ) -> BusWriteAction {
             self.0.write_config_register(reg_idx, offset, data);
-            None
+            std::mem::take(&mut self.1)
         }
 
         fn read_config_register(&mut self, reg_idx: u16) -> u32 {
             self.0.read_reg(reg_idx)
         }
+    }
+
+    #[test]
+    fn test_config_write_actions() {
+        let buses = Arc::new(PciBuses::new(0));
+        let device = Arc::new(Mutex::new(PciDevMock::new()));
+        buses
+            .root_bus()
+            .lock()
+            .unwrap()
+            .add_device(1, device.clone())
+            .unwrap();
+        let mut io_config = PciConfigIo::new(buses.clone());
+        let mut mmio_config = PciConfigMmio::new(buses.clone());
+        io_config.write(0, 0, &(0x8000_0000u32 | (1 << 11)).to_le_bytes());
+
+        device.lock().unwrap().1 = BusWriteAction::PauseVcpu;
+        assert!(matches!(
+            io_config.write(0, 4, &[0]),
+            BusWriteAction::PauseVcpu
+        ));
+        device.lock().unwrap().1 = BusWriteAction::PauseVcpu;
+        assert!(matches!(
+            mmio_config.write(0, 1 << 15, &[0]),
+            BusWriteAction::PauseVcpu
+        ));
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        device.lock().unwrap().1 = BusWriteAction::WaitFor(barrier.clone());
+        let BusWriteAction::WaitFor(returned) = io_config.write(0, 4, &[0]) else {
+            panic!("PIO configuration writes must forward the synchronization action");
+        };
+        assert!(Arc::ptr_eq(&barrier, &returned));
+        device.lock().unwrap().1 = BusWriteAction::WaitFor(barrier.clone());
+        let BusWriteAction::WaitFor(returned) = mmio_config.write(0, 1 << 15, &[0]) else {
+            panic!("MMIO configuration writes must forward the synchronization action");
+        };
+        assert!(Arc::ptr_eq(&barrier, &returned));
+        {
+            let _device = device.try_lock().unwrap();
+        }
+        {
+            let _bus = buses.root_bus().try_lock().unwrap();
+        }
+
+        // Invalid accesses remain ignored without requesting a vCPU pause.
+        assert!(matches!(
+            io_config.write(0, 7, &[0; 2]),
+            BusWriteAction::Continue
+        ));
+        io_config.write(0, 0, &0x8001_0000u32.to_le_bytes());
+        assert!(matches!(
+            io_config.write(0, 4, &[0]),
+            BusWriteAction::Continue
+        ));
+        assert!(matches!(
+            mmio_config.write(0, 1 << 20, &[0]),
+            BusWriteAction::Continue
+        ));
+        assert!(matches!(
+            mmio_config.write(0, u64::MAX, &[0]),
+            BusWriteAction::Continue
+        ));
     }
 
     #[test]
